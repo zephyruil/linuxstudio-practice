@@ -76,6 +76,37 @@ class DistributionTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 installer.verify_package(root)
 
+    def test_real_cli_duplicate_submit_and_pending_do_not_use_login_or_http(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            job_id='00000000-0000-4000-8000-000000000001'
+            directory=root/'jobs'/job_id;directory.mkdir(parents=True)
+            report={'status':'awaiting_answers','username':'synthetic','run_id':'synthetic-run',
+                'commands':['mkdir'],'command_error_counts':{'mkdir':0},
+                'pending':[{'key':'mkdir:1:1','command':'mkdir','stage':1,'total':2,'task':'synthetic task'}]}
+            (directory/'report.json').write_text(json.dumps(report))
+            (directory/'worker.json').write_text(json.dumps({'pid':os.getpid()}))
+            answers=root/'answers.json';answers.write_text('{"mkdir:1:1":"mkdir synthetic"}')
+            env={**os.environ,'PYTHONUTF8':'1','LINUXSTUDIO_DATA_DIR':str(root)}
+            entry=[sys.executable,str(ROOT/'linuxstudio-practice/scripts/launcher.py')]
+            def call(*args,expected_code=0):
+                result=subprocess.run([*entry,*args],env=env,capture_output=True,text=True,encoding='utf-8',timeout=10)
+                self.assertEqual(result.returncode,expected_code,result.stdout+result.stderr)
+                return json.loads(result.stdout)
+            self.assertEqual(call('job','submit',job_id,'--answers-file',str(answers))['status'],'answers_queued')
+            original=(directory/'control.json').read_bytes()
+            self.assertEqual(call('job','submit',job_id,'--answers-file',str(answers))['status'],'waiting_for_worker')
+            self.assertEqual((directory/'control.json').read_bytes(),original)
+            pending=call('job','pending',job_id,'--wait','0')
+            self.assertEqual(pending['status'],'answers_queued')
+            self.assertEqual(pending['pending'],[])
+            self.assertEqual(call('job','status',job_id,'--compact')['pending_count'],1)
+            for value in ('-1','31','nan','inf'):
+                result=subprocess.run([*entry,'job','pending',job_id,'--wait',value],env=env,capture_output=True,timeout=10)
+                self.assertEqual(result.returncode,2)
+            self.assertFalse((directory/'halt.json').exists())
+            self.assertFalse((root/'private').exists())
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -34,6 +34,8 @@ $skill = Join-Path $HOME '.agents\skills\linuxstudio-practice'
 
 调用流程：`catalog → job start → job pending → 常规题直接作答 → job submit → 完成或跳过卡住的命令 → job report`。不再预读全部教程。不熟悉的命令或首次判题失败时，才用 `lesson` 查该命令的相关部分，随后 `job attach-lessons` 附加获取凭据；同一命令后续关卡复用已读内容。整个授权清单放在一个作业，数量由程序统计。
 
+默认由主 Agent 直接处理，只有用户要求才派子代理，HTTP 作业始终由一个 Agent 管理。每轮使用一份 pending 快照，批量生成一份答案 JSON，校验后只提交一次；随后 `job pending <id> --wait 3` 本地等待下一轮，无需固定长时间 sleep。忙碌时返回空 pending，重复提交返回 `waiting_for_worker`，不会覆盖队列或误停作业。当前重试的反馈直接包含在 pending 的 `last_rejection` 中；必要时用 `job status <id> --compact`，避免打印全部历史。终态统一调用一次 `job report <id> --verify-progress`，不逐轮核验。聊天简报保留结果、卡关、错误和耗时，完整失败记录留在本机报告。
+
 默认 **每个命令累计失败 3 次，就跳过该命令并继续其余项目**，不再因普通判题拒绝而整批停止。全部处理后，有跳过项则状态为 `partial`，最终集中报告卡关清单；不自动反复补做。教程无法获取等具体困难也可用 `job skip` 显式记录后继续。账号失效、提交超时结果未知、坏答案 JSON 或并发冲突仍会停止整批，且不自动重试 POST。仅这类执行异常需要人工审核恢复。`job report --verify-progress` 核验实际完成的部分，保留拒绝、跳过、教程凭据与失败历史。完整命令和报告格式见 [CLI 参考](linuxstudio-practice/references/cli.md)。
 
 ## 运行数据
@@ -59,4 +61,4 @@ python tools/build.py
 
 `tools/build.py` 更新清单并以明确文件范围打包，禁止包含凭据、会话和个人记录。ZIP 默认在仓库外 `dist`，可显式指定目录。源码修改后须先重建清单再安装。清单用于完整性校验，不是作者签名。
 
-版本：1.2.0。改为按需查教程、单命令阈值跳过并继续、`partial` 结果和手动跳过入口。`job start` 不再强制教程凭据；拒绝后重试才要求通过 `job attach-lessons` 附加相关凭据。保留 Windows 文件占用重试和关键执行异常的停机保护。
+版本：1.3.0。优化单 Agent 批量执行、单轮单次提交、按需查教程和简洁报告；新增本地 pending 等待、当前拒绝反馈、精简状态与重复提交保护，作业记录实际 worker 版本。保留每命令三次拒绝后跳过继续、Windows 文件占用重试、登录会话复用和关键执行异常的停机保护。跳过项需用户要求后再补做，不自动重开作业重置预算。

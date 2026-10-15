@@ -47,6 +47,7 @@ def summarize_report(directory, report):
     counts = {name:sum(s['command']==name for s in failures) for name in report['commands']}
     scope = report.get('error_budget_scope','job')
     return {'job_id':directory.name, 'username':report.get('username'), 'status':report['status'],
+        'worker_version':report.get('worker_version'),
         'requested_commands':report['commands'], 'requested_count':len(report['commands']),
         'verified_count':sum(i['account_progress_verified'] for i in items), 'commands':items,
         'max_errors':report.get('max_errors',3), 'judge_error_count':len(failures),
@@ -92,6 +93,49 @@ def current_report(directory):
     return report
 
 
+def submission_in_progress(directory, report):
+    if report['status'] in ('starting', 'submitting'):
+        return True
+    if report['status'] != 'awaiting_answers':
+        return False
+    try:
+        control = read_json(directory / 'control.json')
+    except FileNotFoundError:
+        return False
+    keys = {p['key'] for p in report.get('pending', [])}
+    return control.get('run_id') == report.get('run_id') and bool(keys.intersection(control.get('answers', {})))
+
+
+def pending_snapshot(directory, report):
+    busy = submission_in_progress(directory, report)
+    result = {k: report.get(k) for k in ('status', 'username', 'run_id', 'error', 'error_count', 'max_errors',
+                                        'command_error_counts', 'skipped_commands')}
+    result['worker_version'] = report.get('worker_version')
+    result['skipped_commands'] = [{k:s.get(k) for k in ('command','stage','error_count','reason')}
+                                  for s in report.get('skipped_commands', [])]
+    result['submission_in_progress'] = busy
+    result['pending'] = [] if busy else [dict(p) for p in report.get('pending', [])]
+    if busy and result['status'] == 'awaiting_answers':
+        result['status'] = 'answers_queued'
+    # Return only feedback needed for the current retry, not the full job history.
+    for item in result['pending']:
+        last = next((s for s in reversed(report.get('submissions', []))
+                     if s['command'] == item['command'] and s['stage'] == item['stage']), None)
+        if last and not last['passed']:
+            item['last_rejection'] = {k: last[k] for k in ('attempt', 'answer', 'feedback')}
+    return result
+
+
+def compact_status(report):
+    return {k: report.get(k) for k in ('status', 'username', 'worker_version', 'requested_command_count',
+        'completed_commands', 'error_count', 'command_error_counts', 'error_budget_scope', 'max_errors',
+        'elapsed_total_seconds', 'elapsed_after_login_seconds', 'error',
+        'requires_user_review', 'submission_outcome_unknown')} | {
+            'pending_count': len(report.get('pending', [])),
+            'skipped_commands':[{k:s.get(k) for k in ('command','stage','error_count','reason')}
+                                for s in report.get('skipped_commands', [])]}
+
+
 def authenticated(account=None, allow_prompt=False):
     import requests
     from linuxstudio_session import attach_session
@@ -106,7 +150,7 @@ def authenticated(account=None, allow_prompt=False):
 
 def execute(args):
     from runtime_paths import DATA_DIR, JOBS_DIR
-    from linuxstudio_common import (BASE, catalog, progress, write_report, soup_for,
+    from linuxstudio_common import (BASE, VERSION, catalog, progress, write_report, soup_for,
                                    save_lesson_receipt, load_lesson_evidence)
     from linuxstudio_session import (SessionStore, window_status, window_running,
         start_window, atomic_write, LOGOUT_PATH)
@@ -114,7 +158,7 @@ def execute(args):
         import tkinter
         import requests
         import bs4
-        return {'version': '1.2.0', 'platform': sys.platform, 'python': sys.version.split()[0],
+        return {'version': VERSION, 'platform': sys.platform, 'python': sys.version.split()[0],
                 'supported': os.name == 'nt', 'data_dir': str(DATA_DIR),
                 'dependencies': {'requests': requests.__version__, 'beautifulsoup4': bs4.__version__,
                                  'tk': tkinter.TkVersion}, 'browser_required': False}
@@ -235,10 +279,15 @@ def execute(args):
         directory = job_path(args.job_id)
         report = current_report(directory)
         if args.action == 'status':
-            return report
+            return compact_status(report) if getattr(args, 'compact', False) else report
         if args.action == 'pending':
-            return {k: report.get(k) for k in ('status', 'username', 'run_id', 'pending', 'error', 'error_count', 'max_errors',
-                                              'command_error_counts','skipped_commands')}
+            deadline = time.monotonic() + getattr(args, 'wait', 0)
+            while True:
+                snapshot = pending_snapshot(directory, report)
+                if not snapshot['submission_in_progress'] or time.monotonic() >= deadline:
+                    return snapshot
+                time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+                report = current_report(directory)
         if args.action == 'attach-lessons':
             if report['status']!='awaiting_answers':
                 raise RuntimeError('Attach lessons while the job is awaiting answers, not after completion.')
@@ -293,6 +342,14 @@ def execute(args):
         if args.action == 'submit':
             with SessionStore(directory / 'submission').locked():
                 report = read_json(directory / 'report.json')
+                if submission_in_progress(directory, report):
+                    return {'status':'waiting_for_worker', 'job_id':args.job_id,
+                        'answers_queued':False, 'practice_submitted':False,
+                        'next_action':'Do not submit again. Use job pending --wait 3 for the next answer round.'}
+                if report['status'] in ('complete', 'partial', 'error', 'cancelled'):
+                    return {'status':'job_finished', 'job_status':report['status'], 'job_id':args.job_id,
+                        'requires_user_review':report.get('requires_user_review',False),
+                        'answers_queued':False, 'practice_submitted':False}
                 try:
                     payload = validated_answers(report, read_json(args.answers_file))
                 except (ValueError, OSError) as exc:
@@ -306,11 +363,6 @@ def execute(args):
                     return {'status':'needs_lesson','commands':sorted(needs),'practice_submitted':False,
                         'next_action':'Fetch only these lessons, attach their receipt IDs, then resubmit. The job is still waiting.'}
                 control = directory / 'control.json'
-                if control.exists():
-                    old = read_json(control)
-                    pending_keys = {p['key'] for p in report['pending']}
-                    if old.get('run_id') == report['run_id'] and pending_keys.intersection(old.get('answers', {})):
-                        raise RuntimeError('Previous answers have not been consumed. Wait for updated pending keys.')
                 write_report(control, payload)
             return {'status': 'answers_queued', 'count': len(payload['answers'])}
         if args.action == 'verify':
@@ -355,6 +407,10 @@ def main(argv=None):
         item.add_argument('job_id')
         if name == 'submit':
             item.add_argument('--answers-file', type=Path, required=True)
+        elif name == 'pending':
+            item.add_argument('--wait',type=float,default=0,help='Wait up to 30 seconds locally for a fresh answer round.')
+        elif name == 'status':
+            item.add_argument('--compact',action='store_true',help='Omit prompts, submissions and lesson hashes.')
         elif name == 'report':
             item.add_argument('--verify-progress',action='store_true')
         elif name == 'acknowledge':
@@ -367,6 +423,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == 'job' and args.action == 'start' and args.max_errors < 1:
         parser.error('--max-errors must be positive')
+    if args.command == 'job' and args.action == 'pending' and not 0 <= args.wait <= 30:
+        parser.error('--wait must be between 0 and 30 seconds')
     if args.data_dir:
         os.environ['LINUXSTUDIO_DATA_DIR'] = str(Path(args.data_dir).expanduser().resolve())
     try:

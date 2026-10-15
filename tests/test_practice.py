@@ -111,6 +111,8 @@ class PracticeTests(unittest.TestCase):
         self.assertEqual(report['status'], 'complete')
         self.assertEqual(report['total_stages_passed'], 2)
         self.assertTrue(report['account_progress_verified'])
+        from linuxstudio_common import VERSION
+        self.assertEqual(report['worker_version'], VERSION)
         self.assertEqual([p['step'] for p in site.posts], ['1', '2'])
         self.assertTrue(all(p['success'] == 'server-token' and p['submit_flag'] == 'opaque' for p in site.posts))
 
@@ -479,6 +481,150 @@ class PracticeTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     execute(args)
                 auth.assert_not_called()
+
+    def test_duplicate_submit_keeps_original_batch_before_worker_consumes_it(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            report={'status':'awaiting_answers','run_id':'synthetic-run',
+                'pending':[{'key':'mkdir:1:1','command':'mkdir','stage':1}]}
+            control={'run_id':'synthetic-run','answers':{'mkdir:1:1':'mkdir first'}}
+            (root/'report.json').write_text(json.dumps(report))
+            (root/'control.json').write_text(json.dumps(control))
+            original=(root/'control.json').read_bytes()
+            answers=root/'answers.json';answers.write_text('{"mkdir:1:1":"mkdir second"}')
+            args=argparse.Namespace(command='job',action='submit',job_id='synthetic',answers_file=answers)
+            with patch('linuxstudio.job_path',return_value=root),patch('linuxstudio.current_report',return_value=report), \
+                 patch('linuxstudio.authenticated') as auth:
+                result=execute(args)
+            self.assertEqual(result['status'],'waiting_for_worker')
+            self.assertFalse(result['answers_queued'])
+            self.assertEqual((root/'control.json').read_bytes(),original)
+            self.assertFalse((root/'halt.json').exists())
+            auth.assert_not_called()
+
+    def test_submit_during_startup_or_post_does_not_halt_or_queue(self):
+        for status in ('starting','submitting'):
+            with self.subTest(status=status),tempfile.TemporaryDirectory() as temp:
+                root=Path(temp);report={'status':status}
+                (root/'report.json').write_text(json.dumps(report))
+                args=argparse.Namespace(command='job',action='submit',job_id='synthetic',answers_file=root/'unused.json')
+                with patch('linuxstudio.job_path',return_value=root),patch('linuxstudio.current_report',return_value=report):
+                    self.assertEqual(execute(args)['status'],'waiting_for_worker')
+                self.assertFalse((root/'control.json').exists())
+                self.assertFalse((root/'halt.json').exists())
+
+    def test_terminal_submit_preserves_unknown_outcome_and_review(self):
+        for status in ('complete','partial','error','cancelled'):
+            with self.subTest(status=status),tempfile.TemporaryDirectory() as temp:
+                root=Path(temp);report={'status':status,'requires_user_review':status=='error',
+                    'submission_outcome_unknown':status=='error'}
+                (root/'report.json').write_text(json.dumps(report))
+                original=(root/'report.json').read_bytes()
+                args=argparse.Namespace(command='job',action='submit',job_id='synthetic',answers_file=root/'unused.json')
+                with patch('linuxstudio.job_path',return_value=root),patch('linuxstudio.current_report',return_value=report), \
+                     patch('linuxstudio.authenticated') as auth:
+                    result=execute(args)
+                self.assertEqual(result['status'],'job_finished')
+                self.assertEqual(result['job_status'],status)
+                self.assertEqual(result['requires_user_review'],status=='error')
+                self.assertEqual((root/'report.json').read_bytes(),original)
+                self.assertFalse((root/'control.json').exists())
+                auth.assert_not_called()
+
+    def test_stale_or_malformed_answers_still_halt_a_ready_job(self):
+        for text in ('{broken','{"mkdir:1:1":"mkdir stale"}'):
+            with self.subTest(text=text),tempfile.TemporaryDirectory() as temp:
+                root=Path(temp)
+                report={'status':'awaiting_answers','run_id':'synthetic-run',
+                    'pending':[{'key':'mkdir:2:1','command':'mkdir','stage':2}]}
+                (root/'report.json').write_text(json.dumps(report))
+                answers=root/'answers.json';answers.write_text(text)
+                args=argparse.Namespace(command='job',action='submit',job_id='synthetic',answers_file=answers)
+                with patch('linuxstudio.job_path',return_value=root),patch('linuxstudio.current_report',return_value=report):
+                    with self.assertRaises(ValueError):execute(args)
+                self.assertEqual(json.loads((root/'halt.json').read_text())['category'],'invalid_answer_file_or_state')
+                self.assertFalse((root/'control.json').exists())
+
+    def test_fresh_next_round_can_replace_consumed_control(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            report={'status':'awaiting_answers','run_id':'synthetic-run','command_error_counts':{'mkdir':0},
+                'pending':[{'key':'mkdir:2:1','command':'mkdir','stage':2}]}
+            (root/'report.json').write_text(json.dumps(report))
+            (root/'control.json').write_text(json.dumps({'run_id':'synthetic-run','answers':{'mkdir:1:1':'mkdir first'}}))
+            answers=root/'answers.json';answers.write_text('{"mkdir:2:1":"mkdir next"}')
+            args=argparse.Namespace(command='job',action='submit',job_id='synthetic',answers_file=answers)
+            with patch('linuxstudio.job_path',return_value=root),patch('linuxstudio.current_report',return_value=report):
+                self.assertEqual(execute(args)['status'],'answers_queued')
+            self.assertEqual(json.loads((root/'control.json').read_text())['answers'],{'mkdir:2:1':'mkdir next'})
+
+    def test_pending_hides_unconsumed_keys_and_waits_locally_for_next_round(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            initial={'status':'awaiting_answers','run_id':'synthetic-run',
+                'pending':[{'key':'mkdir:1:1','command':'mkdir','stage':1}]}
+            (root/'control.json').write_text(json.dumps({'run_id':'synthetic-run','answers':{'mkdir:1:1':'mkdir first'}}))
+            args=argparse.Namespace(command='job',action='pending',job_id='synthetic',wait=0)
+            with patch('linuxstudio.job_path',return_value=root),patch('linuxstudio.current_report',return_value=initial):
+                result=execute(args)
+            self.assertEqual(result['status'],'answers_queued')
+            self.assertEqual(result['pending'],[])
+            following={**initial,'pending':[{'key':'mkdir:2:1','command':'mkdir','stage':2}]}
+            args.wait=1
+            with patch('linuxstudio.job_path',return_value=root), \
+                 patch('linuxstudio.current_report',side_effect=[initial,{'status':'submitting'},following]), \
+                 patch('linuxstudio.time.sleep'),patch('linuxstudio.authenticated') as auth:
+                result=execute(args)
+            self.assertFalse(result['submission_in_progress'])
+            self.assertEqual(result['pending'][0]['key'],'mkdir:2:1')
+            auth.assert_not_called()
+
+    def test_pending_wait_is_bounded_when_worker_stays_busy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args=argparse.Namespace(command='job',action='pending',job_id='synthetic',wait=3)
+            with patch('linuxstudio.job_path',return_value=Path(temp)), \
+                 patch('linuxstudio.current_report',return_value={'status':'submitting'}), \
+                 patch('linuxstudio.time.monotonic',side_effect=[0,0,0,3]), \
+                 patch('linuxstudio.time.sleep') as sleep:
+                result=execute(args)
+            self.assertTrue(result['submission_in_progress'])
+            self.assertEqual(result['pending'],[])
+            sleep.assert_called_once_with(0.1)
+
+    def test_pending_feedback_is_only_the_current_rejection(self):
+        from linuxstudio import pending_snapshot
+        report={'status':'awaiting_answers','run_id':'synthetic-run','worker_version':'synthetic-version',
+            'pending':[{'key':'mkdir:2:3','command':'mkdir','stage':2},
+                       {'key':'head:2:1','command':'head','stage':2}],
+            'submissions':[{'command':'head','stage':1,'attempt':1,'passed':False,'answer':'old','feedback':'old error'},
+                           {'command':'mkdir','stage':2,'attempt':1,'passed':False,'answer':'first','feedback':'first error'},
+                           {'command':'mkdir','stage':2,'attempt':2,'passed':False,'answer':'latest','feedback':'use parent path'}]}
+        with tempfile.TemporaryDirectory() as temp:
+            result=pending_snapshot(Path(temp),report)
+        self.assertEqual(result['pending'][0]['last_rejection'],
+            {'attempt':2,'answer':'latest','feedback':'use parent path'})
+        self.assertNotIn('last_rejection',result['pending'][1])
+        self.assertNotIn('last_rejection',report['pending'][0])
+        self.assertEqual(result['worker_version'],'synthetic-version')
+
+    def test_compact_status_keeps_outcome_without_full_feedback_or_tutorials(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            report={'status':'partial','username':'synthetic','worker_version':'synthetic-version',
+                'commands':['mkdir','head'],'requested_command_count':2,'completed_commands':['head'],
+                'error_count':3,'pending':[], 'submissions':[{'feedback':'large historical response'}],
+                'lesson_evidence':[{'sha256':'synthetic-hash'}],
+                'skipped_commands':[{'command':'mkdir','stage':2,'error_count':3,'reason':'budget',
+                                     'feedback':'large rejection','task':'old task'}]}
+            args=argparse.Namespace(command='job',action='status',job_id='synthetic',compact=True)
+            with patch('linuxstudio.job_path',return_value=root),patch('linuxstudio.current_report',return_value=report):
+                result=execute(args)
+                args.compact=False
+                self.assertEqual(execute(args),report)
+            self.assertEqual(result['completed_commands'],['head'])
+            self.assertEqual(result['skipped_commands'],[{'command':'mkdir','stage':2,'error_count':3,'reason':'budget'}])
+            self.assertNotIn('submissions',result)
+            self.assertNotIn('lesson_evidence',result)
 
 
 if __name__ == '__main__':

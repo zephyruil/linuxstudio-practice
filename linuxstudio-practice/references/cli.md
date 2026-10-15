@@ -13,8 +13,8 @@ Examples use `run.cmd` from the installed skill. Equivalent: `python scripts/lau
 .\run.cmd lesson --commands head tail
 .\run.cmd progress --commands ls mkdir
 .\run.cmd job start --commands ls mkdir
-.\run.cmd job pending <job_id>
-.\run.cmd job status <job_id>
+.\run.cmd job pending <job_id> --wait 3
+.\run.cmd job status <job_id> --compact
 .\run.cmd job submit <job_id> --answers-file C:\Temp\answers.json
 .\run.cmd lesson --commands <only unfamiliar or rejected commands>
 .\run.cmd job attach-lessons <job_id> --lesson-receipts <receipt_id>
@@ -27,7 +27,7 @@ Examples use `run.cmd` from the installed skill. Equivalent: `python scripts/lau
 
 Only `login` initiates login; `session show` reveals an already-running owner. No command interacts with a browser. `login` reuses a valid session; to change account use the owner's **重新登录 / 切换账号** button, or `session logout` then `login`. The picker offers new account, saved account, optional save, and removal of saved accounts. `--account` on a job is a strict identity guard.
 
-`job start` returns a UUID. Poll pending after a short wait (typically 1–3 seconds; no busy polling). Pending example:
+`job start` returns a UUID. Use `job pending <id> --wait 3` to wait locally for the first or next answer round. `--wait` defaults to zero and accepts 0–30 seconds; it makes no site requests. During startup, submission, or an unconsumed answer batch it returns `submission_in_progress=true` and no actionable pending items. If still busy after the bounded wait, back off briefly. Avoid fixed long sleeps after every round and do not repeatedly reread an unchanged snapshot. Pending example:
 
 ```json
 {"status":"awaiting_answers","pending":[{"key":"mkdir:1:1","command":"mkdir","stage":1,"total":3,"task":"actual website prompt"}]}
@@ -39,13 +39,15 @@ Write only current keys and answer strings:
 {"mkdir:1:1":"mkdir example_directory"}
 ```
 
-Keys include command, stage, attempt. Do not recycle an answer file after keys change. One file can cover all pending commands. `answers_queued` means queued; inspect the next report for server feedback. Maximum answer length is 2000 characters. Never include passwords in answers.
+Keys include command, stage, attempt. Use one snapshot, one validated answer file and one submit for each round. One file can cover all pending commands. Do not recycle an answer file after keys change or create repeated draft/final copies. `answers_queued` means queued; wait for fresh pending before submitting again. A redundant submit while starting/submitting or with an unconsumed batch returns `waiting_for_worker` without queueing, overwriting control or halting. A submit to a terminal job returns `job_finished` with its actual status and queues nothing; it never resumes an error or clears review requirements. Invalid JSON or stale keys submitted to a ready job still trigger critical review. Maximum answer length is 2000 characters. Never include passwords in answers.
+
+On a current retry, pending includes `last_rejection` (attempt, answer, feedback) for that command and stage. It omits unrelated historical feedback and tutorial hashes. Prefer this to dumping full `job status`. Use `job status --compact` only when needed for counts/errors; full status remains available for focused diagnostics. Worker reports include `worker_version` for new v1.3 jobs; absence in old reports means unknown, not the currently installed version.
 
 One unfinished job per account is allowed. A competing start is rejected immediately and signals the existing worker to halt before its next submission. Do not use failed starts or multiple agents as a queue. Cancellation/halt is cooperative: an in-flight POST may finish before it is observed. Already-recorded website progress remains. Jobs wait at most 30 minutes for answers. After unknown POST outcomes, inspect live state before a new job; the client never automatically retries POST.
 
 The default `--max-errors 3` is now a **per-command** budget, cumulative across that command's stages. Successes do not reset its count. On reaching it, the worker records that command as skipped and continues all other commands, including further answers in the same batch. Total rejections across commands are still reported but are not a global stop budget. Only change the threshold when the user requests it. Keep the full authorized list in one job. Invalid answer JSON/state and other critical execution failures still halt for review.
 
-`partial` is a terminal batch outcome: some commands were deferred, while the rest were attempted and any completed subset verified. It does not lock the account or require an acknowledgment dialog. Finish other commands first; do not automatically loop back over deferred ones. `job skip` can explicitly defer a currently pending command if its tutorial cannot be read or a specific problem remains; record the reason. A critical stopped/error job still blocks new jobs until the user explicitly requests a reviewed retry and confirms `job acknowledge` locally. Unknown POST outcomes never receive automatic retries. Legacy v1.1 judge-budget-only stops no longer block new work under the v1.2 policy; their original reports are retained, and they are not automatically resumed. Other old critical stops remain protected.
+`partial` is a terminal batch outcome: some commands were deferred, while the rest were attempted and any completed subset verified. It does not lock the account or require an acknowledgment dialog. Finish other commands and report deferrals; only retry skipped commands in a new job when the user requests it, never to silently reset budgets. `job skip` can explicitly defer a currently pending command if its tutorial cannot be read or a specific problem remains; record the reason. A critical stopped/error job still blocks new jobs until the user explicitly requests a reviewed retry and confirms `job acknowledge` locally. Unknown POST outcomes never receive automatic retries. Legacy v1.1 judge-budget-only stops no longer block new work under the v1.2 policy; their original reports are retained, and they are not automatically resumed. Other old critical stops remain protected.
 
 Reports live in `<data-dir>\jobs\<UUID>`, containing account, prompts, answers, feedback, request timing, wall time, and before/after progress. Wall time includes agent thinking/waiting. Cookies/passwords are excluded. `session status` is local evidence; `--verify` checks the site. `job verify` checks the same account and fresh colors after every stage was confirmed.
 
@@ -65,7 +67,9 @@ On Windows, a polling reader can temporarily prevent atomic file replacement. Ve
 
 ## Final report contract
 
-Use `job report <id> --verify-progress` as the numerical/evidence source, on success and on failure. This is read-only on the website and does not resume the stopped worker. The report keeps every rejection, stop reason, pending stage, tutorial receipt and reviewed previous failure. A pre-lit item counts as a completed redo only if this job also passed every stage.
+Use `job report <id> --verify-progress` once at the end as the numerical/evidence source, on success and on failure. This is read-only on the website and does not resume the stopped worker. If `job verify` already performed the fresh final check, use `job report <id>` without `--verify-progress`; do not also call `progress`. The report keeps every rejection, stop reason, pending stage, tutorial receipt and reviewed previous failure. A pre-lit item counts as a completed redo only if this job also passed every stage.
+
+Keep the user-facing result concise: outcome, verified/requested count, skipped or still-pending names, judge/tool error counts, elapsed time and a local report link. Mention critical stops and approved restarts explicitly. The following details belong in the local report; expand them in chat only for unresolved issues or a requested audit. Use recorded timing fields, and mark missing timing unknown; file mtime or no file writes do not prove execution duration or agent inactivity.
 
 Report in this order, with partial outcomes and critical stops prominent:
 

@@ -15,7 +15,7 @@ from urllib.parse import urljoin, urldefrag, urlsplit
 
 import requests
 
-from linuxstudio_common import BASE, soup_for, verify_identity, write_report, progress
+from linuxstudio_common import BASE, VERSION, soup_for, verify_identity, write_report, progress
 from linuxstudio_login import login_interactive
 
 
@@ -81,7 +81,7 @@ def main():
     topics = {name: available[name] for name in args.commands}
     if any(not re.fullmatch(r'1_\d+_' + re.escape(name), topic) for name, topic in topics.items()):
         raise RuntimeError('Invalid topic mapping.')
-    report = {'status': 'starting', 'username': args.login,
+    report = {'status': 'starting', 'username': args.login, 'worker_version': VERSION,
               'run_id': str(uuid.uuid4()), 'commands': list(topics),
               'transport': 'Python requests.Session; HTTP only',
               'browser_foreground_used': False, 'password_saved': False,
