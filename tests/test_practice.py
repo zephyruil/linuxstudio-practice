@@ -67,7 +67,7 @@ class Site:
 
 
 class PracticeTests(unittest.TestCase):
-    def run_worker(self, site, transient_control_lock=False, commands=None, max_errors=3, halt_after_first=False, skip_initial=None):
+    def run_worker(self, site, transient_control_lock=False, commands=None, max_errors=3, halt_after_first=False, skip_initial=None, legacy_control=False):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             catalog = root / 'catalog.json'
@@ -90,8 +90,12 @@ class PracticeTests(unittest.TestCase):
                 if value['status'] == 'awaiting_answers':
                     if skip_initial:
                         write_report(root/'skip_requests.json',{skip_initial:'synthetic tutorial unavailable'})
-                    control.write_text(json.dumps({'run_id': value['run_id'],
-                        'answers': {p['key']: 'mkdir synthetic_dir' for p in value['pending']}}), encoding='utf-8')
+                    payload={'run_id': value['run_id'],
+                        'answers': {p['key']: 'mkdir synthetic_dir' for p in value['pending']}}
+                    if not legacy_control:
+                        payload.update(submission_id='synthetic-batch-'+str(value['round_id']),
+                            queued_at=worker.time.time(), queued_monotonic=worker.time.monotonic())
+                    control.write_text(json.dumps(payload), encoding='utf-8')
             argv = ['worker', '--reuse-only', '--login', 'synthetic', '--commands', *commands,
                     '--max-errors',str(max_errors),
                     '--catalog-file', str(catalog), '--report', str(report), '--control-file', str(control)]
@@ -326,7 +330,7 @@ class PracticeTests(unittest.TestCase):
             receipt=save_lesson_receipt('synthetic',[{'command':'mkdir','topic':'1_60_mkdir',
                 'url':'http://www.linuxstudio.cn/study/content/content_1_60_mkdir.php','text':'synthetic lesson'}])
             args=argparse.Namespace(command='job',action='start',commands=['mkdir'],account=None,
-                lesson_receipts=[receipt['id']],max_errors=3)
+                lesson_receipts=[receipt['id']],max_errors=3,task_started_at=100.5)
             with patch('linuxstudio.authenticated',return_value=(Site(),LoginResult('synthetic',False,False))), \
                  patch('linuxstudio_common.catalog',return_value={'mkdir':'1_60_mkdir'}),patch('subprocess.Popen') as spawn:
                 spawn.return_value.pid=12345
@@ -337,6 +341,9 @@ class PracticeTests(unittest.TestCase):
             self.assertEqual(json.loads(report_path.with_name('lessons.json').read_text())[0]['id'],receipt['id'])
             command=spawn.call_args.args[0]
             self.assertEqual(command[command.index('--max-errors')+1],'3')
+            self.assertEqual(command[command.index('--task-started-at')+1],'100.5')
+            self.assertEqual(json.loads(report_path.read_text())['task_started_at'],100.5)
+            self.assertIn('--job-requested-at',command)
 
     def test_concurrent_start_halts_existing_job_instead_of_waiting(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -740,6 +747,179 @@ class PracticeTests(unittest.TestCase):
             result=pending_snapshot(Path(temp),report)
         self.assertEqual(result['pending'][0]['rejected_answers'],['mkdir wrong'])
         self.assertNotIn('rejected_answers',item)
+
+    def test_submit_wait_returns_next_round_without_another_submit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            report={'status':'awaiting_answers','run_id':'synthetic-run','round_id':1,
+                'pending':[{'key':'mkdir:1:1','command':'mkdir','stage':1,'task':'first task'}]}
+            following={**report,'round_id':2,'pending':[{'key':'mkdir:2:1','command':'mkdir','stage':2,'task':'next task'}]}
+            (root/'report.json').write_text(json.dumps(report))
+            answers=root/'answers.json';answers.write_text('{"mkdir:1:1":"mkdir synthetic"}')
+            args=argparse.Namespace(command='job',action='submit',job_id='synthetic',answers_file=answers,wait=3)
+            with patch('linuxstudio.job_path',return_value=root), \
+                 patch('linuxstudio.current_report',side_effect=[report,report,following]), \
+                 patch('linuxstudio.time.sleep'),patch('requests.sessions.Session.request') as request:
+                result=execute(args)
+            self.assertTrue(result['answers_queued'])
+            self.assertFalse(result['wait_timed_out'])
+            self.assertEqual(result['submitted_round_id'],1)
+            self.assertEqual(result['next']['round_id'],2)
+            self.assertEqual(result['next']['pending'][0]['key'],'mkdir:2:1')
+            control=json.loads((root/'control.json').read_text())
+            self.assertEqual(control['submission_id'],result['submission_id'])
+            self.assertEqual(control['answers'],{'mkdir:1:1':'mkdir synthetic'})
+            self.assertIsInstance(control['queued_monotonic'],float)
+            request.assert_not_called()
+
+    def test_submit_wait_timeout_keeps_queued_ack_and_never_resubmits(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            report={'status':'awaiting_answers','run_id':'synthetic-run','round_id':1,
+                'pending':[{'key':'mkdir:1:1','command':'mkdir','stage':1,'task':'first task'}]}
+            (root/'report.json').write_text(json.dumps(report))
+            answers=root/'answers.json';answers.write_text('{"mkdir:1:1":"mkdir synthetic"}')
+            args=argparse.Namespace(command='job',action='submit',job_id='synthetic',answers_file=answers,wait=0)
+            with patch('linuxstudio.job_path',return_value=root),patch('linuxstudio.current_report',return_value=report):
+                result=execute(args)
+                original=(root/'control.json').read_bytes()
+                repeated=execute(args)
+            self.assertEqual(result['status'],'answers_queued')
+            self.assertTrue(result['answers_queued'])
+            self.assertTrue(result['wait_timed_out'])
+            self.assertEqual(result['next']['pending'],[])
+            self.assertEqual(repeated['status'],'waiting_for_worker')
+            self.assertEqual((root/'control.json').read_bytes(),original)
+            self.assertFalse((root/'halt.json').exists())
+
+    def test_submit_wait_preserves_terminal_success_partial_and_unknown_post_error(self):
+        for status in ('complete','partial','error'):
+            with self.subTest(status=status),tempfile.TemporaryDirectory() as temp:
+                root=Path(temp)
+                report={'status':'awaiting_answers','run_id':'synthetic-run',
+                    'pending':[{'key':'mkdir:1:1','command':'mkdir','stage':1,'task':'first task'}]}
+                terminal={'status':status,'requires_user_review':status=='error','submission_outcome_unknown':status=='error',
+                    'error':'unknown POST outcome' if status=='error' else None,'completed_commands':['mkdir'] if status=='complete' else []}
+                (root/'report.json').write_text(json.dumps(report))
+                answers=root/'answers.json';answers.write_text('{"mkdir:1:1":"mkdir synthetic"}')
+                args=argparse.Namespace(command='job',action='submit',job_id='synthetic',answers_file=answers,wait=3)
+                with patch('linuxstudio.job_path',return_value=root), \
+                     patch('linuxstudio.current_report',side_effect=[report,terminal]),patch('linuxstudio.authenticated') as auth:
+                    result=execute(args)
+                self.assertTrue(result['answers_queued'])
+                self.assertFalse(result['wait_timed_out'])
+                self.assertEqual(result['next']['status'],status)
+                self.assertEqual(result['next']['requires_user_review'],status=='error')
+                self.assertEqual(result['next']['submission_outcome_unknown'],status=='error')
+                auth.assert_not_called()
+
+    def test_read_failure_after_queue_does_not_lose_ack_or_requeue(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            report={'status':'awaiting_answers','run_id':'synthetic-run',
+                'pending':[{'key':'mkdir:1:1','command':'mkdir','stage':1,'task':'first task'}]}
+            (root/'report.json').write_text(json.dumps(report))
+            answers=root/'answers.json';answers.write_text('{"mkdir:1:1":"mkdir synthetic"}')
+            args=argparse.Namespace(command='job',action='submit',job_id='synthetic',answers_file=answers,wait=3)
+            with patch('linuxstudio.job_path',return_value=root), \
+                 patch('linuxstudio.current_report',side_effect=[report,PermissionError('synthetic read denial')]):
+                result=execute(args)
+            self.assertEqual(result['status'],'answers_queued')
+            self.assertTrue(result['answers_queued'])
+            self.assertIn('synthetic read denial',result['next_error'])
+            self.assertIsNone(result['wait_timed_out'])
+            self.assertEqual(json.loads((root/'control.json').read_text())['submission_id'],result['submission_id'])
+            self.assertFalse((root/'halt.json').exists())
+
+    def test_local_reanalysis_and_lesson_blocks_never_enter_combined_wait(self):
+        for answer,expected in [('mkdir wrong','needs_reanalysis'),('mkdir changed','needs_lesson')]:
+            with self.subTest(expected=expected),tempfile.TemporaryDirectory() as temp:
+                root=Path(temp)
+                report={'status':'awaiting_answers','run_id':'synthetic-run','command_error_counts':{'mkdir':1},
+                    'pending':[{'key':'mkdir:1:2','command':'mkdir','stage':1,'task':'same task'}],
+                    'submissions':[{'command':'mkdir','stage':1,'task':'same task','attempt':1,
+                                    'answer':'mkdir wrong','passed':False,'feedback':'rejected'}]}
+                (root/'report.json').write_text(json.dumps(report))
+                answers=root/'answers.json';answers.write_text(json.dumps({'mkdir:1:2':answer}))
+                args=argparse.Namespace(command='job',action='submit',job_id='synthetic',answers_file=answers,wait=3)
+                with patch('linuxstudio.job_path',return_value=root),patch('linuxstudio.current_report',return_value=report), \
+                     patch('linuxstudio.wait_for_pending') as wait:
+                    self.assertEqual(execute(args)['status'],expected)
+                    wait.assert_not_called()
+                self.assertFalse((root/'control.json').exists())
+                self.assertFalse((root/'halt.json').exists())
+
+    def test_round_timings_cover_each_batch_and_match_actual_submission_counts(self):
+        code,report=self.run_worker(Site())
+        self.assertEqual(code,0)
+        self.assertEqual([r['round_id'] for r in report['rounds']],[1,2])
+        for item in report['rounds']:
+            self.assertEqual(item['status'],'processed')
+            self.assertEqual(item['recorded_submission_count'],1)
+            self.assertEqual(item['passed_stages'],1)
+            self.assertEqual(item['judge_rejections'],0)
+            self.assertGreaterEqual(item['time_to_queue_seconds'],0)
+            self.assertGreaterEqual(item['worker_pickup_seconds'],0)
+            self.assertGreaterEqual(item['processing_seconds'],0)
+            self.assertEqual(item['submission_id'],'synthetic-batch-'+str(item['round_id']))
+            self.assertIn('+00:00',item['ready_at_utc'])
+        self.assertEqual(sum(r['recorded_submission_count'] for r in report['rounds']),len(report['submissions']))
+        with tempfile.TemporaryDirectory() as temp:
+            summary=summarize_report(Path(temp),report)
+        self.assertEqual(summary['round_count'],2)
+        self.assertEqual(summary['submission_count'],2)
+        self.assertEqual(summary['first_attempt_stages_passed'],2)
+        self.assertEqual(summary['timing']['queue_timed_round_count'],2)
+        self.assertIsNone(summary['timing']['task_elapsed_to_verification_seconds'])
+
+    def test_round_timings_preserve_error_and_skipped_states(self):
+        code,report=self.run_worker(Site(timeout=True))
+        self.assertEqual(code,1)
+        item=report['rounds'][-1]
+        self.assertEqual(item['status'],'error')
+        self.assertTrue(item['submission_outcome_unknown'])
+        self.assertEqual(item['recorded_submission_count'],0)
+        code,report=self.run_worker(Site(reject=True))
+        self.assertEqual(code,0)
+        self.assertEqual(report['status'],'partial')
+        self.assertEqual(len(report['rounds']),3)
+        self.assertEqual(sum(r['judge_rejections'] for r in report['rounds']),3)
+
+    def test_task_elapsed_is_explicit_and_ends_at_final_verification(self):
+        from linuxstudio import save_verification
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            with patch('linuxstudio.time.time',return_value=200),patch('linuxstudio.time.perf_counter',return_value=52):
+                value=save_verification(root,{'status':'complete','task_started_at':100},'synthetic',{},50)
+                self.assertEqual(value['task_elapsed_to_verification_seconds'],100)
+                self.assertEqual(value['verification_seconds'],2)
+                for start in (None,300):
+                    value=save_verification(root,{'status':'complete','task_started_at':start},'synthetic',{},50)
+                    self.assertIsNone(value['task_elapsed_to_verification_seconds'])
+                value=save_verification(root,{'status':'awaiting_answers','task_started_at':100},'synthetic',{},50)
+                self.assertIsNone(value['task_elapsed_to_verification_seconds'])
+
+    def test_legacy_control_timing_is_unknown_instead_of_a_zero_estimate(self):
+        code,report=self.run_worker(Site(),legacy_control=True)
+        self.assertEqual(code,0)
+        self.assertTrue(all(r['time_to_queue_seconds'] is None for r in report['rounds']))
+        self.assertTrue(all(r['awaiting_answers_seconds']>=0 for r in report['rounds']))
+        with tempfile.TemporaryDirectory() as temp:
+            summary=summarize_report(Path(temp),report)
+        self.assertEqual(summary['timing']['queue_timed_round_count'],0)
+        self.assertIsNone(summary['timing']['time_to_queue_seconds_total'])
+
+    def test_unexpected_worker_death_preserves_unknown_in_flight_post(self):
+        from linuxstudio import current_report
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            (root/'report.json').write_text(json.dumps({'status':'submitting','in_flight':{'command':'mkdir'}}))
+            (root/'worker.json').write_text('{"pid":12345}')
+            with patch('linuxstudio_session.process_running',return_value=False):
+                result=current_report(root)
+            self.assertEqual(result['status'],'error')
+            self.assertTrue(result['requires_user_review'])
+            self.assertTrue(result['submission_outcome_unknown'])
 
 
 if __name__ == '__main__':

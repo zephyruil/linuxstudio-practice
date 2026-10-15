@@ -34,7 +34,11 @@ $skill = Join-Path $HOME '.agents\skills\linuxstudio-practice'
 
 调用流程：`catalog → job start → job pending → 常规题直接作答 → job submit → 完成或跳过卡住的命令 → job report`。不再预读全部教程。不熟悉的命令或首次判题失败时，才用 `lesson` 查该命令的相关部分，随后 `job attach-lessons` 附加获取凭据；同一命令后续关卡复用已读内容。整个授权清单放在一个作业，数量由程序统计。
 
-默认由主 Agent 直接处理，只有用户要求才派子代理，HTTP 作业始终由一个 Agent 管理。每轮使用一份 pending 快照，批量生成一份答案 JSON，校验后只提交一次；随后 `job pending <id> --wait 3` 本地等待下一轮，无需固定长时间 sleep。忙碌时返回空 pending，重复提交返回 `waiting_for_worker`，不会覆盖队列或误停作业。当前重试的反馈直接包含在 pending 的 `last_rejection` 中；必要时用 `job status <id> --compact`，避免打印全部历史。终态统一调用一次 `job report <id> --verify-progress`，不逐轮核验。聊天简报保留结果、卡关、错误和耗时，完整失败记录留在本机报告。
+默认由主 Agent 直接处理，只有用户要求才派子代理，HTTP 作业始终由一个 Agent 管理。每轮使用一份 pending 快照，批量生成一份答案 JSON，校验后只提交一次，并使用下文的合并等待入口，无需固定长时间 sleep。忙碌时返回空 pending，重复提交返回 `waiting_for_worker`，不会覆盖队列或误停作业。当前重试的反馈直接包含在 pending 的 `last_rejection` 中；必要时用 `job status <id> --compact`，避免打印全部历史。终态统一调用一次 `job report <id> --verify-progress`，不逐轮核验。聊天简报保留结果、卡关、错误和耗时，完整失败记录留在本机报告。
+
+推荐改用 `job submit <id> --answers-file <path> --wait 3`，提交后直接返回 `next` 题目或终态，省去每轮另一次 pending 调用。`wait_timed_out=true` 或 `next_error` 都保留 `answers_queued=true`，表示已经入队，应继续查 pending，不能重交。拦截、教程检查和关键停机保护保持不变。
+
+新版自动记录逐轮就绪、入队写入起点、worker 接收和处理结束的计时，以及提交/通过/判错数量。答题等待包含模型、工具、教程和人工延迟，不等于纯模型思考。首次本机检查前记录 Unix 秒并传给 `job start --task-started-at`，最终报告另给出“首次检查至最终在线核验”的任务耗时；未记录则为未知。比较速度时同时看命令数、关卡数、完成率和错误，不能仅比较 worker 秒数。字段和示例见 CLI 参考。
 
 同一作业中，同一命令、同一关卡且题干完全相同时，已被网站拒绝的完全相同答案会在本地拦截，返回 `needs_reanalysis` 并附先前反馈，不发送 HTTP、不消耗判错预算、不停止作业。含重复项的整批答案均不入队；Agent 应重新分析后修改，或先移除被拦项、提交其余题目，不要等待不存在的新一轮。pending 的 `rejected_answers` 帮助避免重交；无法找到有依据的新答案时可显式跳过。拦截只比较完全相同的文本，不做 shell 等价归并；不可单纯换空格规避。拦截记录单独保存在本机 `local_duplicate_blocks.json`，最终报告与网站判错分开统计。
 
@@ -63,4 +67,4 @@ python tools/build.py
 
 `tools/build.py` 更新清单并以明确文件范围打包，禁止包含凭据、会话和个人记录。ZIP 默认在仓库外 `dist`，可显式指定目录。源码修改后须先重建清单再安装。清单用于完整性校验，不是作者签名。
 
-版本：1.3.1。新增重复失败答案的本地拦截和重新分析提示，拦截不占网站判错预算；在最终报告中单独统计。保留 v1.3.0 的单 Agent 批量执行、本地 pending 等待、精简状态、忙碌时重复提交保护，以及每命令三次拒绝后跳过继续、会话复用和关键执行异常保护。
+版本：1.4.0。新增提交后直接返回下一轮、明确的入队/等待超时状态、逐轮计时和独立的任务至最终核验计时。保留重复失败答案本地拦截、每命令三次拒绝预算、跳过继续、会话复用和关键停机保护。未扩展跨数据目录的互斥机制。

@@ -3,6 +3,7 @@
 Examples use `run.cmd` from the installed skill. Equivalent: `python scripts/launcher.py`. Full installation uses its own `.venv`. Put `--data-dir <absolute directory>` **before** the subcommand to isolate testing; owner and workers inherit it.
 
 ```powershell
+$practiceTaskStarted = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
 .\run.cmd doctor
 .\run.cmd login
 .\run.cmd login --account example_user
@@ -12,10 +13,10 @@ Examples use `run.cmd` from the installed skill. Equivalent: `python scripts/lau
 .\run.cmd catalog
 .\run.cmd lesson --commands head tail
 .\run.cmd progress --commands ls mkdir
-.\run.cmd job start --commands ls mkdir
+.\run.cmd job start --commands ls mkdir --task-started-at $practiceTaskStarted
 .\run.cmd job pending <job_id> --wait 3
 .\run.cmd job status <job_id> --compact
-.\run.cmd job submit <job_id> --answers-file C:\Temp\answers.json
+.\run.cmd job submit <job_id> --answers-file C:\Temp\answers.json --wait 3
 .\run.cmd lesson --commands <only unfamiliar or rejected commands>
 .\run.cmd job attach-lessons <job_id> --lesson-receipts <receipt_id>
 .\run.cmd job skip <job_id> --commands <blocked commands> --reason "tutorial unavailable or specific blocking condition"
@@ -40,6 +41,39 @@ Write only current keys and answer strings:
 ```
 
 Keys include command, stage, attempt. Use one snapshot, one validated answer file and one submit for each round. One file can cover all pending commands. Do not recycle an answer file after keys change or create repeated draft/final copies. `answers_queued` means queued; wait for fresh pending before submitting again. A redundant submit while starting/submitting or with an unconsumed batch returns `waiting_for_worker` without queueing, overwriting control or halting. A submit to a terminal job returns `job_finished` with its actual status and queues nothing; it never resumes an error or clears review requirements. Invalid JSON or stale keys submitted to a ready job still trigger critical review. Maximum answer length is 2000 characters. Never include passwords in answers.
+
+## Submit and return the next round
+
+Prefer `job submit <id> --answers-file <path> --wait 3`. After writing exactly one batch, it releases the submission lock and waits locally for fresh pending or a terminal state. It never posts answers itself, generates a next answer, or retries a POST. `--wait` accepts 0–30 seconds; omitting it preserves the earlier queue-only behavior.
+
+The top-level acknowledgment remains `status=answers_queued, answers_queued=true`, with `submission_id` and `submitted_round_id`. The nested `next` is a normal compact pending response, including `round_id`, current tasks/feedback, and `round_timing`. Act on that snapshot directly rather than calling pending again:
+
+- `next.status=awaiting_answers`: use its current keys for the next answer map.
+- `next.status=complete` or `partial`: finish and perform the single final progress check.
+- `next.status=error`: honor `requires_user_review`, error and any `submission_outcome_unknown`; never restart/retry automatically.
+- `wait_timed_out=true`: the batch is already queued but the worker is still busy. Continue `job pending --wait 3`, never repeat submit.
+- `next_error`: local status reading failed after queueing. The acknowledgment is retained, `next=null` and `wait_timed_out=null`; inspect pending/status without resubmitting.
+
+Local reanalysis/lesson blocks, busy submissions and terminal submissions retain their existing responses; they do not enter the combined wait or queue a new batch. A terminal `next` is not proof of fresh final verification; use the final-report contract.
+
+## Timing and workload
+
+Each worker pending publication gets an incrementing `round_id`; one round may submit only part of its pending map. Raw and summarized reports retain `rounds`, including UTC ready/processing/finish timestamps and:
+
+| Field | Meaning |
+| --- | --- |
+| `time_to_queue_seconds` | Ready to the CLI timestamp immediately before atomic queue writing; includes agent/tool/tutorial/human delays. |
+| `worker_pickup_seconds` | Queue timestamp to worker pickup; includes local queue-write and detection delay. |
+| `awaiting_answers_seconds` | Ready to pickup, also available for legacy control files without queue timestamps. |
+| `processing_seconds` | Pickup through recorded batch processing, including HTTP, parsing and local writes. |
+| `recorded_post_seconds` | Sum of HTTP durations for recorded submission results; an unknown interrupted POST is not counted as a known result. |
+| `recorded_submission_count`, `passed_stages`, `judge_rejections` | Actual recorded work in this round. |
+
+Round status is `awaiting_answers`, `processing`, `processed`, `deferred` (manual skip changed the pending plan), or `error`. Missing queue timestamps produce null values, not invented zero durations. Durations use the same host's monotonic clock; UTC timestamps correlate events. A critical worker exit with an in-flight request retains the unknown-outcome flag.
+
+Capture `$practiceTaskStarted` once before the first setup check, in the same shell call as that check, then preserve it for job start. If tool calls use fresh shells, output this nonsecret number and pass its literal value later; do not assume the variable survives or reset the start. `--task-started-at` is optional Unix seconds. Final `verification.json` records `verification_seconds` (identity/progress check, excluding file write) and `task_elapsed_to_verification_seconds` (first local setup check through final progress response). Task elapsed includes login/approval delays and separate CLI calls; it excludes earlier conversation/Skill reading. If omitted, the job is still active, or the clock moved before the start, task elapsed is null. It cannot replace the original worker elapsed field.
+
+`job report` adds workload counts and a `timing` summary. Worker HTTP totals exclude separate CLI lesson and verification requests; processing includes HTTP, so these totals overlap and must not be added as disjoint phases. Time-to-queue is not model thinking time. Old reports have missing timing; never reconstruct it from file mtime. Compare batches using verified commands, stages passed, submissions, errors and both timing boundaries; distinguish redo of pre-lit items from newly lit progress.
 
 On a current retry, pending includes `last_rejection` (attempt, answer, feedback) for that command and stage. It omits unrelated historical feedback and tutorial hashes. Prefer this to dumping full `job status`. Use `job status --compact` only when needed for counts/errors; full status remains available for focused diagnostics. Worker reports include `worker_version` for new v1.3 jobs; absence in old reports means unknown, not the currently installed version.
 
@@ -75,7 +109,7 @@ On Windows, a polling reader can temporarily prevent atomic file replacement. Ve
 
 Use `job report <id> --verify-progress` once at the end as the numerical/evidence source, on success and on failure. This is read-only on the website and does not resume the stopped worker. If `job verify` already performed the fresh final check, use `job report <id>` without `--verify-progress`; do not also call `progress`. The report keeps every rejection, stop reason, pending stage, tutorial receipt and reviewed previous failure. A pre-lit item counts as a completed redo only if this job also passed every stage.
 
-Keep the user-facing result concise: outcome, verified/requested count, skipped or still-pending names, judge/tool error counts, any local duplicate blocks, elapsed time and a local report link. Mention critical stops and approved restarts explicitly. The following details belong in the local report; expand them in chat only for unresolved issues or a requested audit. Use recorded timing fields, and mark missing timing unknown; file mtime or no file writes do not prove execution duration or agent inactivity.
+Keep the user-facing result concise: outcome, verified/requested count, stages passed, submissions, skipped/pending names, judge/tool errors, local duplicate blocks, worker seconds, task seconds (or unknown), and a local report link. Mention critical stops and approved restarts explicitly. Expand per-round timing only for a requested audit or an unexplained delay; it remains available in the local report. The following details belong in that report. File mtime or no file writes do not prove execution duration or agent inactivity.
 
 Report in this order, with partial outcomes and critical stops prominent:
 

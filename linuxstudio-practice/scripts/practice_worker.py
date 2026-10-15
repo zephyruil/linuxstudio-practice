@@ -10,6 +10,7 @@ import json
 import re
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urldefrag, urlsplit
 
@@ -74,6 +75,8 @@ def main():
     parser.add_argument('--lesson-file', type=Path)
     parser.add_argument('--max-errors', type=int, default=3)
     parser.add_argument('--reviewed-failures-file',type=Path)
+    parser.add_argument('--job-requested-at',type=float)
+    parser.add_argument('--task-started-at',type=float)
     args = parser.parse_args()
     if args.max_errors < 1:
         parser.error('--max-errors must be positive')
@@ -82,6 +85,8 @@ def main():
     if any(not re.fullmatch(r'1_\d+_' + re.escape(name), topic) for name, topic in topics.items()):
         raise RuntimeError('Invalid topic mapping.')
     report = {'status': 'starting', 'username': args.login, 'worker_version': VERSION,
+              'task_started_at':args.task_started_at, 'job_requested_at':args.job_requested_at,
+              'rounds':[],
               'run_id': str(uuid.uuid4()), 'commands': list(topics),
               'transport': 'Python requests.Session; HTTP only',
               'browser_foreground_used': False, 'password_saved': False,
@@ -91,6 +96,21 @@ def main():
               'command_error_counts':{n:0 for n in topics}, 'skipped_commands':[], 'command_stage_counts':{},
               'reviewed_previous_failed_jobs':json.loads(args.reviewed_failures_file.read_text(encoding='utf-8')) if args.reviewed_failures_file else [],
               'lesson_evidence':json.loads(args.lesson_file.read_text(encoding='utf-8')) if args.lesson_file else []}
+    current_round = None
+    round_started = processing_started = None
+    round_submission_start = 0
+    def close_round(status):
+        if current_round is None or current_round['status'] not in ('awaiting_answers','processing'):
+            return
+        now = time.monotonic()
+        submitted = report['submissions'][round_submission_start:]
+        current_round.update(status=status, finished_at_utc=datetime.now(timezone.utc).isoformat(),
+            elapsed_seconds=round(now-round_started,3),
+            processing_seconds=round(now-processing_started,3) if processing_started is not None else None,
+            recorded_submission_count=len(submitted), passed_stages=sum(s['passed'] for s in submitted),
+            judge_rejections=sum(not s['passed'] for s in submitted),
+            recorded_post_seconds=round(sum(s['http_seconds'] for s in submitted),3),
+            submission_outcome_unknown=bool(report.get('in_flight')))
     def check_halt():
         halt = args.report.with_name('halt.json')
         if halt.exists():
@@ -118,6 +138,7 @@ def main():
     try:
         with TimedSession() as session:
             task_started = time.perf_counter()
+            report['worker_started_at_utc'] = datetime.now(timezone.utc).isoformat()
             session.headers.update({'User-Agent': 'LinuxStudioPracticeHTTP/1.0', 'Cache-Control': 'no-cache'})
             if args.reuse_only:
                 from linuxstudio_session import attach_session
@@ -158,6 +179,15 @@ def main():
                     report['command_error_counts'][c['name']]>0 and c['name'] not in covered}
                     for c in contexts if not c['complete'] and not c['skipped']]
                 report['command_stage_counts'] = {c['name']:c['total'] for c in contexts}
+                round_started = time.monotonic()
+                processing_started = None
+                round_submission_start = len(report['submissions'])
+                current_round = {'round_id':len(report['rounds'])+1, 'status':'awaiting_answers',
+                    'ready_at_utc':datetime.now(timezone.utc).isoformat(), 'pending_count':len(pending),
+                    'ready_elapsed_worker_seconds':round(time.perf_counter()-task_started,3),
+                    'time_to_queue_seconds':None, 'worker_pickup_seconds':None}
+                report['rounds'].append(current_round)
+                report['round_id'] = current_round['round_id']
                 report.update(status='awaiting_answers', pending=pending,
                               elapsed_after_login_seconds=round(time.perf_counter() - started, 3))
                 write_report(args.report, report)
@@ -178,7 +208,16 @@ def main():
                         break
                     time.sleep(0.1)
                 if plan_changed:
+                    close_round('deferred')
                     continue
+                processing_started = time.monotonic()
+                queued = control.get('queued_monotonic')
+                current_round.update(status='processing', processing_started_at_utc=datetime.now(timezone.utc).isoformat(),
+                    submission_id=control.get('submission_id'), queued_at=control.get('queued_at'))
+                if isinstance(queued,(int,float)) and round_started <= queued <= processing_started:
+                    current_round['time_to_queue_seconds'] = round(queued-round_started,3)
+                    current_round['worker_pickup_seconds'] = round(processing_started-queued,3)
+                current_round['awaiting_answers_seconds'] = round(processing_started-round_started,3)
                 report['status'] = 'submitting'
                 if args.lesson_file:
                     report['lesson_evidence'] = json.loads(args.lesson_file.read_text(encoding='utf-8'))
@@ -199,6 +238,7 @@ def main():
                     report['in_flight'] = {'command': context['name'], 'stage': context['stage'],
                                            'attempt': context['attempt']}
                     write_report(args.report, report)
+
                     t = time.perf_counter()
                     # Never retry a POST automatically: an interrupted result is unknown.
                     response = session.post(context['url'], data=payload,
@@ -244,6 +284,8 @@ def main():
                     report['http_practice_seconds_total'] = round(network_seconds, 3)
                     write_report(args.report, report)
 
+                close_round('processed')
+
             report['account_progress_after'] = progress(session, topics)
             report['completed_subset_progress_verified'] = all(
                 report['account_progress_after'].get(name, {}).get('completed') for name in report['completed_commands'])
@@ -258,9 +300,15 @@ def main():
                 raise RuntimeError('All command stages passed, but account progress was not fully lit.')
             report['status'] = 'partial' if report['skipped_commands'] else 'complete'
             report['requires_user_review'] = False
+            report['worker_finished_at_utc'] = datetime.now(timezone.utc).isoformat()
             write_report(args.report, report)
     except Exception as exc:
+        close_round('error')
         report.update(status='error', error=str(exc), requires_user_review=True)
+        report['worker_finished_at_utc'] = datetime.now(timezone.utc).isoformat()
+        if 'baseline_http' in locals():
+            report['http_request_seconds_total'] = round(session.request_seconds-baseline_http,3)
+            report['http_request_count'] = session.request_count-baseline_count
         report['elapsed_total_seconds'] = round(time.perf_counter() - task_started, 3) if 'task_started' in locals() else 0
         report['total_stages_passed'] = sum(s['passed'] for s in report['submissions'])
         if 'contexts' in locals():

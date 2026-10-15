@@ -46,12 +46,17 @@ def summarize_report(directory, report):
     failures = [s for s in report.get('submissions',[]) if not s['passed']]
     counts = {name:sum(s['command']==name for s in failures) for name in report['commands']}
     scope = report.get('error_budget_scope','job')
+    rounds = report.get('rounds', [])
     blocks_path = directory / 'local_duplicate_blocks.json'
     local_blocks = read_json(blocks_path) if blocks_path.exists() else []
     return {'job_id':directory.name, 'username':report.get('username'), 'status':report['status'],
         'worker_version':report.get('worker_version'),
         'requested_commands':report['commands'], 'requested_count':len(report['commands']),
         'verified_count':sum(i['account_progress_verified'] for i in items), 'commands':items,
+        'total_stages_passed':sum(s['passed'] for s in report.get('submissions',[])),
+        'submission_count':len(report.get('submissions',[])),
+        'first_attempt_stages_passed':sum(s['passed'] and s['attempt']==1 for s in report.get('submissions',[]))
+            if all('attempt' in s for s in report.get('submissions',[])) else None,
         'max_errors':report.get('max_errors',3), 'judge_error_count':len(failures),
         'local_duplicate_block_count':sum(len(event['blocked_answers']) for event in local_blocks),
         'local_duplicate_blocks':local_blocks,
@@ -67,6 +72,17 @@ def summarize_report(directory, report):
         'lesson_evidence_limit':'Records show fetched content, not whether the model understood it.',
         'reviewed_previous_failed_jobs':report.get('reviewed_previous_failed_jobs',[]),
         'elapsed_total_seconds':report.get('elapsed_total_seconds'),
+        'rounds':rounds, 'round_count':len(rounds),
+        'timing':{'worker_seconds':report.get('elapsed_total_seconds'),
+            'worker_http_seconds':report.get('http_request_seconds_total'),
+            'time_to_queue_seconds_total':round(sum(r.get('time_to_queue_seconds') or 0 for r in rounds),3)
+                if any(r.get('time_to_queue_seconds') is not None for r in rounds) else None,
+            'queue_timed_round_count':sum(r.get('time_to_queue_seconds') is not None for r in rounds),
+            'processing_seconds_total':round(sum(r.get('processing_seconds') or 0 for r in rounds),3) if rounds else None,
+            'final_verification_seconds':verification.get('verification_seconds'),
+            'task_elapsed_to_verification_seconds':verification.get('task_elapsed_to_verification_seconds'),
+            'scope':'Queue waiting includes agent, tools, lessons and human delays; it is not model thinking time. '
+                    'Worker HTTP excludes separate lesson/verification CLI requests. Task elapsed requires a supplied start time.'},
         'submission_outcome_unknown':report.get('submission_outcome_unknown',False)}
 
 
@@ -115,6 +131,8 @@ def current_report(directory):
         if not alive:
             report.update(status='error', requires_user_review=True,
                           error='Worker stopped unexpectedly; inspect any unknown submission outcome before restarting.')
+            if report.get('in_flight'):
+                report['submission_outcome_unknown'] = True
             write_report(directory / 'report.json', report)
     return report
 
@@ -137,6 +155,11 @@ def pending_snapshot(directory, report):
     result = {k: report.get(k) for k in ('status', 'username', 'run_id', 'error', 'error_count', 'max_errors',
                                         'command_error_counts', 'skipped_commands')}
     result['worker_version'] = report.get('worker_version')
+    result['round_id'] = report.get('round_id')
+    result['round_timing'] = report.get('rounds', [None])[-1] if report.get('rounds') else None
+    result['completed_count'] = len(report.get('completed_commands', []))
+    result['requires_user_review'] = report.get('requires_user_review', False)
+    result['submission_outcome_unknown'] = report.get('submission_outcome_unknown', False)
     result['skipped_commands'] = [{k:s.get(k) for k in ('command','stage','error_count','reason')}
                                   for s in report.get('skipped_commands', [])]
     result['submission_in_progress'] = busy
@@ -155,11 +178,35 @@ def pending_snapshot(directory, report):
     return result
 
 
+def wait_for_pending(directory, report, seconds):
+    deadline = time.monotonic() + seconds
+    while True:
+        snapshot = pending_snapshot(directory, report)
+        if not snapshot['submission_in_progress'] or time.monotonic() >= deadline:
+            return snapshot
+        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+        report = current_report(directory)
+
+
+def save_verification(directory, report, username, current, started):
+    from linuxstudio_common import write_report
+    now = time.time()
+    task_start = report.get('task_started_at')
+    value = {'username':username, 'progress':current, 'at':now,
+        'verification_seconds':round(time.perf_counter()-started,3),
+        'task_elapsed_to_verification_seconds':round(now-task_start,3)
+            if report.get('status') in ('complete','partial','error','cancelled')
+                and isinstance(task_start,(int,float)) and 0 < task_start <= now else None}
+    write_report(directory / 'verification.json', value)
+    return value
+
+
 def compact_status(report):
     return {k: report.get(k) for k in ('status', 'username', 'worker_version', 'requested_command_count',
         'completed_commands', 'error_count', 'command_error_counts', 'error_budget_scope', 'max_errors',
         'elapsed_total_seconds', 'elapsed_after_login_seconds', 'error',
         'requires_user_review', 'submission_outcome_unknown')} | {
+            'round_id':report.get('round_id'),
             'pending_count': len(report.get('pending', [])),
             'skipped_commands':[{k:s.get(k) for k in ('command','stage','error_count','reason')}
                                 for s in report.get('skipped_commands', [])]}
@@ -250,6 +297,8 @@ def execute(args):
             return {'username': auth.username, 'progress': progress(client, names)}
     if args.command == 'job':
         if args.action == 'start':
+            job_requested_at = time.time()
+            task_started_at = getattr(args, 'task_started_at', None)
             if len(args.commands) != len(set(args.commands)):
                 raise ValueError('Duplicate command names.')
             client, auth = authenticated(args.account)
@@ -289,13 +338,16 @@ def execute(args):
                 write_report(directory / 'lessons.json', lessons)
                 write_report(directory / 'reviewed_failures.json', reviewed)
                 write_report(directory / 'report.json', {'status': 'starting', 'username': auth.username,
-                                                       'commands': args.commands})
+                    'commands': args.commands, 'job_requested_at':job_requested_at, 'task_started_at':task_started_at})
                 command = [sys.executable, str(Path(__file__).with_name('practice_worker.py')),
                     '--reuse-only', '--login', auth.username, '--commands', *args.commands,
                     '--catalog-file', str(directory / 'catalog.json'),
                     '--lesson-file', str(directory / 'lessons.json'), '--max-errors',str(args.max_errors),
                     '--reviewed-failures-file', str(directory / 'reviewed_failures.json'),
+                    '--job-requested-at',str(job_requested_at),
                     '--report', str(directory / 'report.json'), '--control-file', str(directory / 'control.json')]
+                if task_started_at is not None:
+                    command += ['--task-started-at',str(task_started_at)]
                 with (directory / 'worker.log').open('wb') as log:
                     process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                                creationflags=subprocess.CREATE_NO_WINDOW)
@@ -310,13 +362,7 @@ def execute(args):
         if args.action == 'status':
             return compact_status(report) if getattr(args, 'compact', False) else report
         if args.action == 'pending':
-            deadline = time.monotonic() + getattr(args, 'wait', 0)
-            while True:
-                snapshot = pending_snapshot(directory, report)
-                if not snapshot['submission_in_progress'] or time.monotonic() >= deadline:
-                    return snapshot
-                time.sleep(min(0.1, max(0, deadline - time.monotonic())))
-                report = current_report(directory)
+            return wait_for_pending(directory, report, getattr(args, 'wait', 0))
         if args.action == 'attach-lessons':
             if report['status']!='awaiting_answers':
                 raise RuntimeError('Attach lessons while the job is awaiting answers, not after completion.')
@@ -358,10 +404,11 @@ def execute(args):
             return {'status':'review_acknowledged','job_id':args.job_id,'practice_submitted':False}
         if args.action == 'report':
             if args.verify_progress:
+                verification_started = time.perf_counter()
                 client, auth = authenticated(report['username'])
                 with client:
                     current = progress(client, report['commands'])
-                write_report(directory / 'verification.json', {'username':auth.username,'progress':current,'at':time.time()})
+                save_verification(directory, report, auth.username, current, verification_started)
             return summarize_report(directory, report)
         if args.action == 'cancel':
             if report.get('status') in ('complete', 'partial', 'error', 'cancelled'):
@@ -404,21 +451,37 @@ def execute(args):
                     return {'status':'needs_lesson','commands':sorted(needs),'practice_submitted':False,
                         'next_action':'Fetch only these lessons, attach their receipt IDs, then resubmit. The job is still waiting.'}
                 control = directory / 'control.json'
+                payload.update(submission_id=str(uuid.uuid4()), round_id=report.get('round_id'),
+                    queued_at=time.time(), queued_monotonic=time.monotonic())
                 write_report(control, payload)
-            return {'status': 'answers_queued', 'count': len(payload['answers'])}
+            result = {'status':'answers_queued', 'answers_queued':True, 'count':len(payload['answers']),
+                'submission_id':payload['submission_id'], 'submitted_round_id':payload['round_id']}
+            # Release the submission lock before waiting. A wait/read failure cannot undo queueing.
+            if getattr(args, 'wait', None) is not None:
+                try:
+                    result['next'] = wait_for_pending(directory, current_report(directory), args.wait)
+                    result['wait_timed_out'] = result['next']['submission_in_progress']
+                    if result['wait_timed_out']:
+                        result['next_action'] = 'Batch already queued. Continue job pending --wait 3; do not resubmit.'
+                except Exception as exc:
+                    result.update(next=None, next_error=str(exc), wait_timed_out=None,
+                        next_action='Batch already queued; inspect job pending/status. Do not resubmit.')
+            return result
         if args.action == 'verify':
             if report.get('status') != 'complete' or set(report.get('completed_commands', [])) != set(report['commands']):
                 raise RuntimeError('All stages have not been confirmed complete. Read job status.')
+            verification_started = time.perf_counter()
             client, auth = authenticated(report['username'])
             with client:
                 current = progress(client, report['commands'])
             verified = all(current.get(n, {}).get('completed') for n in report['commands'])
             if not verified:
                 raise RuntimeError('Account progress has not lit for every requested command.')
-            write_report(directory / 'verification.json', {'username':auth.username,'progress':current,'at':time.time()})
+            verification = save_verification(directory, report, auth.username, current, verification_started)
             return {'status': 'verified', 'username': auth.username, 'account_progress_verified': True,
                     'progress': current, 'elapsed_total_seconds': report.get('elapsed_total_seconds'),
-                    'total_stages_passed': report.get('total_stages_passed')}
+                    'total_stages_passed': report.get('total_stages_passed'),
+                    'task_elapsed_to_verification_seconds':verification['task_elapsed_to_verification_seconds']}
     raise ValueError('Unsupported command.')
 
 
@@ -441,6 +504,7 @@ def main(argv=None):
     start = job.add_parser('start')
     start.add_argument('--commands', nargs='+', required=True)
     start.add_argument('--account')
+    start.add_argument('--task-started-at',type=float,help='Optional Unix seconds captured before the first task setup check.')
     start.add_argument('--lesson-receipts',nargs='+',default=[])
     start.add_argument('--max-errors',type=int,default=3,help='Total judge rejections per command before deferring it.')
     for name in ('status', 'pending', 'submit', 'verify', 'cancel', 'report', 'acknowledge','attach-lessons','skip'):
@@ -448,6 +512,7 @@ def main(argv=None):
         item.add_argument('job_id')
         if name == 'submit':
             item.add_argument('--answers-file', type=Path, required=True)
+            item.add_argument('--wait',type=float,default=None,help='After queueing, wait locally up to 30 seconds and return the next round.')
         elif name == 'pending':
             item.add_argument('--wait',type=float,default=0,help='Wait up to 30 seconds locally for a fresh answer round.')
         elif name == 'status':
@@ -464,8 +529,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == 'job' and args.action == 'start' and args.max_errors < 1:
         parser.error('--max-errors must be positive')
-    if args.command == 'job' and args.action == 'pending' and not 0 <= args.wait <= 30:
+    if args.command == 'job' and args.action in ('pending','submit') and args.wait is not None and not 0 <= args.wait <= 30:
         parser.error('--wait must be between 0 and 30 seconds')
+    if args.command == 'job' and args.action == 'start' and args.task_started_at is not None and not 0 < args.task_started_at <= time.time():
+        parser.error('--task-started-at must be positive Unix seconds, not later than now')
     if args.data_dir:
         os.environ['LINUXSTUDIO_DATA_DIR'] = str(Path(args.data_dir).expanduser().resolve())
     try:

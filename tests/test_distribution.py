@@ -7,6 +7,8 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 
@@ -104,6 +106,13 @@ class DistributionTests(unittest.TestCase):
             for value in ('-1','31','nan','inf'):
                 result=subprocess.run([*entry,'job','pending',job_id,'--wait',value],env=env,capture_output=True,timeout=10)
                 self.assertEqual(result.returncode,2)
+                result=subprocess.run([*entry,'job','submit',job_id,'--answers-file',str(answers),'--wait',value],
+                    env=env,capture_output=True,timeout=10)
+                self.assertEqual(result.returncode,2)
+            for value in ('-1','nan','inf',str(time.time()+3600)):
+                result=subprocess.run([*entry,'job','start','--commands','mkdir','--task-started-at',value],
+                    env=env,capture_output=True,timeout=10)
+                self.assertEqual(result.returncode,2)
             self.assertFalse((directory/'halt.json').exists())
             self.assertFalse((root/'private').exists())
 
@@ -145,6 +154,63 @@ class DistributionTests(unittest.TestCase):
             self.assertEqual(summary['judge_error_count'],2)
             self.assertEqual(summary['remaining_budget_per_command'],{'mkdir':2,'rmdir':2})
             self.assertFalse((directory/'control.json').exists())
+            self.assertFalse((directory/'halt.json').exists())
+            self.assertFalse((root/'private').exists())
+
+    def test_real_cli_submit_wait_observes_next_round_then_completion(self):
+        from linuxstudio_common import write_report
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            job_id='00000000-0000-4000-8000-000000000003'
+            directory=root/'jobs'/job_id;directory.mkdir(parents=True)
+            report={'status':'awaiting_answers','username':'synthetic','run_id':'synthetic-run','round_id':1,
+                'commands':['mkdir'],'command_error_counts':{'mkdir':0},
+                'pending':[{'key':'mkdir:1:1','command':'mkdir','stage':1,'task':'synthetic first task'}]}
+            write_report(directory/'report.json',report)
+            write_report(directory/'worker.json',{'pid':os.getpid()})
+            answers=root/'answers.json'
+            env={**os.environ,'PYTHONUTF8':'1','LINUXSTUDIO_DATA_DIR':str(root)}
+            entry=[sys.executable,str(ROOT/'linuxstudio-practice/scripts/launcher.py')]
+            failures=[]
+            batches=[]
+            def synthetic_worker(stage):
+                try:
+                    deadline=time.monotonic()+8
+                    while time.monotonic()<deadline:
+                        try:
+                            payload=json.loads((directory/'control.json').read_text(encoding='utf-8'))
+                        except (OSError,ValueError):
+                            payload={}
+                        if 'mkdir:'+str(stage)+':1' in payload.get('answers',{}):
+                            batches.append(payload['submission_id'])
+                            break
+                        time.sleep(0.01)
+                    else:
+                        raise RuntimeError('Synthetic worker did not receive the queued batch')
+                    if stage==1:
+                        following={**report,'round_id':2,'pending':[{'key':'mkdir:2:1','command':'mkdir','stage':2,'task':'synthetic next task'}]}
+                    else:
+                        following={**report,'round_id':2,'status':'complete','pending':[],
+                            'completed_commands':['mkdir'],'requires_user_review':False}
+                    write_report(directory/'report.json',following)
+                except Exception as exc:
+                    failures.append(str(exc))
+            for stage in (1,2):
+                answers.write_text(json.dumps({'mkdir:'+str(stage)+':1':'mkdir synthetic'}))
+                thread=threading.Thread(target=synthetic_worker,args=(stage,),daemon=True)
+                thread.start()
+                result=subprocess.run([*entry,'job','submit',job_id,'--answers-file',str(answers),'--wait','3'],
+                    env=env,capture_output=True,text=True,encoding='utf-8',timeout=10)
+                thread.join(timeout=8)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(failures,[])
+                self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+                value=json.loads(result.stdout)
+                self.assertTrue(value['answers_queued'])
+                self.assertFalse(value['wait_timed_out'])
+                self.assertEqual(value['next']['status'],'awaiting_answers' if stage==1 else 'complete')
+                self.assertEqual(value['next']['round_id'],2)
+            self.assertEqual(len(set(batches)),2)
             self.assertFalse((directory/'halt.json').exists())
             self.assertFalse((root/'private').exists())
 
