@@ -24,6 +24,41 @@ def read_json(path):
     return json.loads(Path(path).read_text(encoding='utf-8-sig'))
 
 
+def halt_job(directory, category, reason):
+    from linuxstudio_common import write_report
+    write_report(directory / 'halt.json', {'category':category, 'reason':reason, 'at':time.time()})
+
+
+def summarize_report(directory, report):
+    verification_path = directory / 'verification.json'
+    verification = read_json(verification_path) if verification_path.exists() else {}
+    current = verification.get('progress', {})
+    items = []
+    for name in report['commands']:
+        passed = {s['stage'] for s in report.get('submissions',[]) if s['command']==name and s['passed']}
+        total = report.get('command_stage_counts',{}).get(name)
+        all_stages = bool(total and len(passed)==total and name in report.get('completed_commands',[]))
+        verified = bool(all_stages and current.get(name,{}).get('completed'))
+        items.append({'command':name, 'passed_stages':len(passed), 'total_stages':total,
+            'all_stages_passed':all_stages, 'account_progress_verified':verified,
+            'newly_lit':verified and report.get('account_progress_before',{}).get(name,{}).get('completed') is False,
+            'next_stage':None if all_stages else len(passed)+1})
+    failures = [s for s in report.get('submissions',[]) if not s['passed']]
+    return {'job_id':directory.name, 'username':report.get('username'), 'status':report['status'],
+        'requested_commands':report['commands'], 'requested_count':len(report['commands']),
+        'verified_count':sum(i['account_progress_verified'] for i in items), 'commands':items,
+        'max_errors':report.get('max_errors',3), 'judge_error_count':len(failures),
+        'remaining_error_budget':max(0,report.get('max_errors',3)-len(failures)),
+        'stopped_by_error_budget':report.get('stopped_by_error_budget',False),
+        'stop_reason':report.get('error'), 'requires_user_review':report.get('requires_user_review',False),
+        'execution_issue':report.get('execution_issue'),
+        'all_failed_submissions':failures, 'lesson_evidence':report.get('lesson_evidence',[]),
+        'lesson_evidence_limit':'Records show fetched content, not whether the model understood it.',
+        'reviewed_previous_failed_jobs':report.get('reviewed_previous_failed_jobs',[]),
+        'elapsed_total_seconds':report.get('elapsed_total_seconds'),
+        'submission_outcome_unknown':report.get('submission_outcome_unknown',False)}
+
+
 def validated_answers(report, answers):
     if report.get('status') != 'awaiting_answers':
         raise ValueError('Job is not awaiting answers. Read job status first.')
@@ -45,7 +80,8 @@ def current_report(directory):
         except (OSError, KeyError, ValueError):
             alive = False
         if not alive:
-            report.update(status='error', error='Worker stopped unexpectedly; inspect any unknown submission outcome before restarting.')
+            report.update(status='error', requires_user_review=True,
+                          error='Worker stopped unexpectedly; inspect any unknown submission outcome before restarting.')
             write_report(directory / 'report.json', report)
     return report
 
@@ -64,14 +100,15 @@ def authenticated(account=None, allow_prompt=False):
 
 def execute(args):
     from runtime_paths import DATA_DIR, JOBS_DIR
-    from linuxstudio_common import BASE, catalog, progress, write_report, soup_for
+    from linuxstudio_common import (BASE, catalog, progress, write_report, soup_for,
+                                   save_lesson_receipt, load_lesson_evidence)
     from linuxstudio_session import (SessionStore, window_status, window_running,
         start_window, atomic_write, LOGOUT_PATH)
     if args.command == 'doctor':
         import tkinter
         import requests
         import bs4
-        return {'version': '1.0.2', 'platform': sys.platform, 'python': sys.version.split()[0],
+        return {'version': '1.1.0', 'platform': sys.platform, 'python': sys.version.split()[0],
                 'supported': os.name == 'nt', 'data_dir': str(DATA_DIR),
                 'dependencies': {'requests': requests.__version__, 'beautifulsoup4': bs4.__version__,
                                  'tk': tkinter.TkVersion}, 'browser_required': False}
@@ -127,7 +164,9 @@ def execute(args):
                     if not text.strip():
                         raise RuntimeError('Empty lesson; inspect the tutorial link on the site.')
                     lessons.append({'command':name, 'topic':topics[name], 'url':url, 'text':text})
+                receipt = save_lesson_receipt(auth.username, lessons)
                 return {'username':auth.username, 'source':'LinuxStudio own tutorials', 'lessons':lessons,
+                        'lesson_receipt_id':receipt['id'],
                         'practice_submitted':False}
             return {'username': auth.username, 'progress': progress(client, names)}
     if args.command == 'job':
@@ -139,35 +178,78 @@ def execute(args):
                 topics = catalog(client)
             if not set(args.commands).issubset(topics):
                 raise ValueError('Unknown command. Read catalog first.')
+            selected = {n:topics[n] for n in args.commands}
+            lessons = load_lesson_evidence(args.lesson_receipts, auth.username, selected)
             # Serialize creation; a second worker must not race the same PHP exercise.
             with SessionStore(JOBS_DIR / 'creation').locked():
+                reviewed = []
                 for old in JOBS_DIR.glob('*/report.json'):
                     previous = current_report(old.parent)
+                    if previous.get('username') != auth.username:
+                        continue
+                    if previous.get('requires_user_review'):
+                        if not (old.parent / 'acknowledged.json').exists():
+                            raise RuntimeError('A previous job requires human review: ' + old.parent.name +
+                                '. Do not restart to reset the error budget. Ask the user first.')
+                        reviewed.append({'job_id':old.parent.name, 'status':previous['status'],
+                            'error':previous.get('error'), 'error_count':previous.get('error_count'),
+                            'acknowledgment':read_json(old.parent / 'acknowledged.json')})
                     if (previous.get('status') not in ('complete', 'error', 'cancelled') and
                         previous.get('username') == auth.username):
-                        raise RuntimeError('An unfinished job exists for this account: ' + old.parent.name + '. Cancel or finish it first.')
+                        halt_job(old.parent, 'concurrency_conflict', 'Another job start was attempted for the same account.')
+                        raise RuntimeError('Concurrent job start blocked; existing job halted for human review: ' + old.parent.name)
                 job_id = str(uuid.uuid4())
                 directory = job_path(job_id)
                 directory.mkdir(parents=True)
                 write_report(directory / 'catalog.json', {n: topics[n] for n in args.commands})
+                write_report(directory / 'lessons.json', lessons)
+                write_report(directory / 'reviewed_failures.json', reviewed)
                 write_report(directory / 'report.json', {'status': 'starting', 'username': auth.username,
                                                        'commands': args.commands})
                 command = [sys.executable, str(Path(__file__).with_name('practice_worker.py')),
                     '--reuse-only', '--login', auth.username, '--commands', *args.commands,
                     '--catalog-file', str(directory / 'catalog.json'),
+                    '--lesson-file', str(directory / 'lessons.json'), '--max-errors',str(args.max_errors),
+                    '--reviewed-failures-file', str(directory / 'reviewed_failures.json'),
                     '--report', str(directory / 'report.json'), '--control-file', str(directory / 'control.json')]
                 with (directory / 'worker.log').open('wb') as log:
                     process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                                creationflags=subprocess.CREATE_NO_WINDOW)
                 write_report(directory / 'worker.json', {'pid': process.pid, 'created_at': time.time()})
             return {'job_id': job_id, 'status': 'starting', 'username': auth.username,
+                    'requested_command_count':len(args.commands), 'commands':args.commands,
+                    'max_errors':args.max_errors, 'lesson_evidence_count':len(lessons),
                     'report_path': str(directory / 'report.json')}
         directory = job_path(args.job_id)
         report = current_report(directory)
         if args.action == 'status':
             return report
         if args.action == 'pending':
-            return {k: report.get(k) for k in ('status', 'username', 'run_id', 'pending', 'error')}
+            return {k: report.get(k) for k in ('status', 'username', 'run_id', 'pending', 'error', 'error_count', 'max_errors')}
+        if args.action == 'acknowledge':
+            if not report.get('requires_user_review'):
+                raise RuntimeError('No stopped job requires acknowledgment.')
+            import tkinter as tk
+            from tkinter import messagebox
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                approved = messagebox.askyesno('LinuxStudio · 停止后的人工审核',
+                    '作业：' + args.job_id + '\n停止原因：' + str(report.get('error')) +
+                    '\n说明：' + args.reason + '\n\n确认已检查失败记录，并允许后续创建新作业？\n原失败记录会保留，不会自动恢复或提交。',parent=root)
+            finally:
+                root.destroy()
+            if not approved:
+                raise RuntimeError('User did not approve restarting; stop remains in effect.')
+            write_report(directory / 'acknowledged.json', {'reason':args.reason,'at':time.time(),'confirmed_locally':True})
+            return {'status':'review_acknowledged','job_id':args.job_id,'practice_submitted':False}
+        if args.action == 'report':
+            if args.verify_progress:
+                client, auth = authenticated(report['username'])
+                with client:
+                    current = progress(client, report['commands'])
+                write_report(directory / 'verification.json', {'username':auth.username,'progress':current,'at':time.time()})
+            return summarize_report(directory, report)
         if args.action == 'cancel':
             if report.get('status') in ('complete', 'error', 'cancelled'):
                 return {'status': report['status'], 'job_id': args.job_id}
@@ -176,7 +258,11 @@ def execute(args):
         if args.action == 'submit':
             with SessionStore(directory / 'submission').locked():
                 report = read_json(directory / 'report.json')
-                payload = validated_answers(report, read_json(args.answers_file))
+                try:
+                    payload = validated_answers(report, read_json(args.answers_file))
+                except (ValueError, OSError) as exc:
+                    halt_job(directory, 'invalid_answer_file_or_state', str(exc))
+                    raise
                 control = directory / 'control.json'
                 if control.exists():
                     old = read_json(control)
@@ -194,6 +280,7 @@ def execute(args):
             verified = all(current.get(n, {}).get('completed') for n in report['commands'])
             if not verified:
                 raise RuntimeError('Account progress has not lit for every requested command.')
+            write_report(directory / 'verification.json', {'username':auth.username,'progress':current,'at':time.time()})
             return {'status': 'verified', 'username': auth.username, 'account_progress_verified': True,
                     'progress': current, 'elapsed_total_seconds': report.get('elapsed_total_seconds'),
                     'total_stages_passed': report.get('total_stages_passed')}
@@ -219,12 +306,20 @@ def main(argv=None):
     start = job.add_parser('start')
     start.add_argument('--commands', nargs='+', required=True)
     start.add_argument('--account')
-    for name in ('status', 'pending', 'submit', 'verify', 'cancel'):
+    start.add_argument('--lesson-receipts',nargs='+',required=True)
+    start.add_argument('--max-errors',type=int,default=3)
+    for name in ('status', 'pending', 'submit', 'verify', 'cancel', 'report', 'acknowledge'):
         item = job.add_parser(name)
         item.add_argument('job_id')
         if name == 'submit':
             item.add_argument('--answers-file', type=Path, required=True)
+        elif name == 'report':
+            item.add_argument('--verify-progress',action='store_true')
+        elif name == 'acknowledge':
+            item.add_argument('--reason',required=True)
     args = parser.parse_args(argv)
+    if args.command == 'job' and args.action == 'start' and args.max_errors < 1:
+        parser.error('--max-errors must be positive')
     if args.data_dir:
         os.environ['LINUXSTUDIO_DATA_DIR'] = str(Path(args.data_dir).expanduser().resolve())
     try:

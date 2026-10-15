@@ -32,7 +32,9 @@ $skill = Join-Path $HOME '.agents\skills\linuxstudio-practice'
 
 > 使用 $linuxstudio-practice，复用当前登录，完成 mkdir 的全部关卡，确认账号进度点亮并记录耗时。不占用浏览器前台；没有可复用会话时先告知我。
 
-调用流程：`catalog → lesson（读取本站教程）→ job start → job pending → 生成答案 → job submit → 全部关卡 → job verify`。每个命令先读一次本站教程，首次被拒绝后对照教程和完整题目再修改答案。每个账号同时一个作业。命令、答案文件、取消和故障说明见 [CLI 参考](linuxstudio-practice/references/cli.md)。
+调用流程：`catalog → lesson（读取本站教程并保存凭据 ID）→ job start --lesson-receipts <ID> → job pending → 生成答案 → job submit → 全部关卡 → job verify → job report`。每个命令先读一次本站教程，首次被拒绝后对照教程和完整题目再修改答案。整个授权清单放在同一个作业，不分派给多个 Agent；数量由程序统计。
+
+默认整个作业累计 **3 次判题失败即停**，通过一关不清零。工具异常、无效答案文件或并发冲突立即停止。停止后禁止自动重开绕过预算；新作业会被阻止。只有用户明确要求重试，才运行 `job acknowledge`，由用户在本机窗口确认审核；失败记录保留。`job report --verify-progress` 可在停止后只读核验已完成的部分，并保留所有拒绝、教程获取凭据及停止原因。完整命令和最终报告格式见 [CLI 参考](linuxstudio-practice/references/cli.md)。
 
 ## 运行数据
 
@@ -57,4 +59,4 @@ python tools/build.py
 
 `tools/build.py` 更新清单并以明确文件范围打包，禁止包含凭据、会话和个人记录。ZIP 默认在仓库外 `dist`，可显式指定目录。源码修改后须先重建清单再安装。清单用于完整性校验，不是作者签名。
 
-版本：1.0.2。新增 `lesson` 只读命令及先读本站教程的作答流程；保留 1.0.1 的 Windows 文件占用修复：本地原子替换最多重试 10 秒，答案读取遇到临时 PermissionError 后继续等待。该重试仅针对本机文件，不重试 HTTP 提交。
+版本：1.1.0。新增累计错误阈值、停止后人工审核、教程读取凭据和完整最终报告。调用变更：`job start` 必须带 `--lesson-receipts`，不能沿用 1.0.x 的无凭据启动方式。保留 Windows 文件占用的本地重试，不重试 HTTP 提交。

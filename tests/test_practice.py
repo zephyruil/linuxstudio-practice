@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'linuxstudio-pra
 from bs4 import BeautifulSoup
 import requests
 from linuxstudio_common import parse_catalog, progress
-from linuxstudio import job_path, validated_answers, execute
+from linuxstudio import job_path, validated_answers, execute, summarize_report
 from linuxstudio_login import LoginResult
 import practice_worker as worker
 
@@ -66,11 +66,12 @@ class Site:
 
 
 class PracticeTests(unittest.TestCase):
-    def run_worker(self, site, transient_control_lock=False):
+    def run_worker(self, site, transient_control_lock=False, commands=None, max_errors=3, halt_after_first=False):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             catalog = root / 'catalog.json'
-            catalog.write_text('{"mkdir":"1_60_mkdir"}', encoding='utf-8')
+            commands = commands or ['mkdir']
+            catalog.write_text(json.dumps({n:'1_60_'+n for n in commands}), encoding='utf-8')
             report, control = root / 'report.json', root / 'control.json'
             original_read = Path.read_text
             denied = False
@@ -83,10 +84,13 @@ class PracticeTests(unittest.TestCase):
             from linuxstudio_common import write_report
             def answer_pending(path, value):
                 write_report(path, value)
+                if halt_after_first and len(value.get('submissions',[]))==1:
+                    write_report(root/'halt.json',{'category':'concurrency_conflict','reason':'synthetic competing start'})
                 if value['status'] == 'awaiting_answers':
                     control.write_text(json.dumps({'run_id': value['run_id'],
                         'answers': {p['key']: 'mkdir synthetic_dir' for p in value['pending']}}), encoding='utf-8')
-            argv = ['worker', '--reuse-only', '--login', 'synthetic', '--commands', 'mkdir',
+            argv = ['worker', '--reuse-only', '--login', 'synthetic', '--commands', *commands,
+                    '--max-errors',str(max_errors),
                     '--catalog-file', str(catalog), '--report', str(report), '--control-file', str(control)]
             with patch.object(sys, 'argv', argv), patch.object(worker, 'TimedSession', return_value=site), \
                  patch('linuxstudio_session.attach_session', return_value=LoginResult('synthetic', False, False)), \
@@ -139,8 +143,46 @@ class PracticeTests(unittest.TestCase):
         site = Site(reject=True)
         code, report = self.run_worker(site)
         self.assertEqual(code, 1)
-        self.assertEqual(len(site.posts), 5)
+        self.assertEqual(len(site.posts), 3)
+        self.assertEqual(report['error_count'],3)
+        self.assertTrue(report['stopped_by_error_budget'])
+        self.assertTrue(report['requires_user_review'])
         self.assertFalse(any(p['passed'] for p in report['submissions']))
+
+    def test_budget_is_cumulative_across_commands_not_per_command(self):
+        site = Site(reject=True)
+        code, report = self.run_worker(site, commands=['mkdir','rmdir'])
+        self.assertEqual(code,1)
+        self.assertEqual(len(site.posts),3)
+        self.assertEqual([s['command'] for s in report['submissions']], ['mkdir','rmdir','mkdir'])
+        self.assertEqual(report['requested_command_count'],2)
+
+    def test_success_between_errors_does_not_reset_budget(self):
+        site = Site()
+        original = site.post
+        def alternating(url, data, **kwargs):
+            if len(site.posts) in (0,2,3):
+                site.posts.append(dict(data))
+                return Response(html(stage=int(data['step']),feedback='很遗憾'))
+            return original(url,data,**kwargs)
+        site.post = alternating
+        code, report = self.run_worker(site)
+        self.assertEqual(code,1)
+        self.assertEqual([s['passed'] for s in report['submissions']], [False,True,False,False])
+        self.assertEqual(report['error_count'],3)
+
+    def test_user_selected_lower_budget_is_enforced(self):
+        site = Site(reject=True)
+        code, report = self.run_worker(site,max_errors=1)
+        self.assertEqual(code,1)
+        self.assertEqual(len(site.posts),1)
+
+    def test_halt_is_checked_between_submissions_in_same_batch(self):
+        site=Site()
+        code,report=self.run_worker(site,commands=['mkdir','rmdir'],halt_after_first=True)
+        self.assertEqual(code,1)
+        self.assertEqual(len(site.posts),1)
+        self.assertEqual(report['execution_issue']['category'],'concurrency_conflict')
 
     def test_hidden_stage_must_match_live_task(self):
         context = {'name': 'mkdir', 'stage': 1, 'attempt': 1,
@@ -199,6 +241,7 @@ class PracticeTests(unittest.TestCase):
         args = argparse.Namespace(command='lesson', commands=['head'], account=None)
         with patch('linuxstudio.authenticated', return_value=(site, LoginResult('synthetic',False,False))), \
              patch('linuxstudio_common.catalog', return_value={'head':'1_130_head'}), \
+             patch('linuxstudio_common.save_lesson_receipt', return_value={'id':'synthetic-receipt'}), \
              patch.object(site, 'get', return_value=Response('<div id="item">head 默认显示前10行<pre>head file</pre></div>')) as get:
             result = execute(args)
         self.assertFalse(result['practice_submitted'])
@@ -216,6 +259,111 @@ class PracticeTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 execute(args)
             get.assert_not_called()
+
+    def test_failed_job_cannot_be_restarted_without_local_review(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            old=root/'synthetic-old'
+            old.mkdir()
+            (old/'report.json').write_text('{}')
+            previous={'username':'synthetic','status':'error','requires_user_review':True}
+            args=argparse.Namespace(command='job',action='start',commands=['mkdir'],account=None,
+                lesson_receipts=['synthetic'],max_errors=3)
+            with patch('runtime_paths.JOBS_DIR',root), patch('linuxstudio.current_report',return_value=previous), \
+                 patch('linuxstudio.authenticated',return_value=(Site(),LoginResult('synthetic',False,False))), \
+                 patch('linuxstudio_common.catalog',return_value={'mkdir':'1_60_mkdir'}), \
+                 patch('linuxstudio_common.load_lesson_evidence',return_value=[]), \
+                 patch('subprocess.Popen') as spawn:
+                with self.assertRaisesRegex(RuntimeError,'human review'):
+                    execute(args)
+                spawn.assert_not_called()
+
+    def test_start_copies_real_receipts_and_passes_budget_to_worker(self):
+        from linuxstudio_common import save_lesson_receipt
+        with tempfile.TemporaryDirectory() as temp, patch('runtime_paths.DATA_DIR',Path(temp)), \
+             patch('runtime_paths.JOBS_DIR',Path(temp)/'jobs'):
+            receipt=save_lesson_receipt('synthetic',[{'command':'mkdir','topic':'1_60_mkdir',
+                'url':'http://www.linuxstudio.cn/study/content/content_1_60_mkdir.php','text':'synthetic lesson'}])
+            args=argparse.Namespace(command='job',action='start',commands=['mkdir'],account=None,
+                lesson_receipts=[receipt['id']],max_errors=3)
+            with patch('linuxstudio.authenticated',return_value=(Site(),LoginResult('synthetic',False,False))), \
+                 patch('linuxstudio_common.catalog',return_value={'mkdir':'1_60_mkdir'}),patch('subprocess.Popen') as spawn:
+                spawn.return_value.pid=12345
+                result=execute(args)
+            report_path=Path(result['report_path'])
+            self.assertEqual(result['requested_command_count'],1)
+            self.assertEqual(result['max_errors'],3)
+            self.assertEqual(json.loads(report_path.with_name('lessons.json').read_text())[0]['id'],receipt['id'])
+            command=spawn.call_args.args[0]
+            self.assertEqual(command[command.index('--max-errors')+1],'3')
+
+    def test_concurrent_start_halts_existing_job_instead_of_waiting(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp); old=root/'synthetic-old';old.mkdir()
+            (old/'report.json').write_text('{}')
+            previous={'username':'synthetic','status':'awaiting_answers'}
+            args=argparse.Namespace(command='job',action='start',commands=['mkdir'],account=None,
+                lesson_receipts=['synthetic'],max_errors=3)
+            with patch('runtime_paths.JOBS_DIR',root), patch('linuxstudio.current_report',return_value=previous), \
+                 patch('linuxstudio.authenticated',return_value=(Site(),LoginResult('synthetic',False,False))), \
+                 patch('linuxstudio_common.catalog',return_value={'mkdir':'1_60_mkdir'}), \
+                 patch('linuxstudio_common.load_lesson_evidence',return_value=[]), \
+                 patch('subprocess.Popen') as spawn:
+                with self.assertRaisesRegex(RuntimeError,'Concurrent'):
+                    execute(args)
+                spawn.assert_not_called()
+            self.assertEqual(json.loads((old/'halt.json').read_text())['category'],'concurrency_conflict')
+
+    def test_invalid_answer_json_halts_without_writing_control(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            report={'status':'awaiting_answers','commands':['mkdir'],'pending':[{'key':'mkdir:1:1'}]}
+            (root/'report.json').write_text(json.dumps(report))
+            answers=root/'answers.json';answers.write_text('{broken')
+            args=argparse.Namespace(command='job',action='submit',job_id='synthetic',answers_file=answers)
+            with patch('linuxstudio.job_path',return_value=root),patch('linuxstudio.current_report',return_value=report):
+                with self.assertRaises(ValueError):execute(args)
+            self.assertTrue((root/'halt.json').exists())
+            self.assertFalse((root/'control.json').exists())
+
+    def test_report_retains_failures_and_does_not_count_pre_lit_incomplete(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            (root/'verification.json').write_text(json.dumps({'progress':{'mkdir':{'completed':True},'rmdir':{'completed':True}}}))
+            report={'status':'error','commands':['mkdir','rmdir'],'command_stage_counts':{'mkdir':2,'rmdir':2},
+                'completed_commands':['mkdir'],'max_errors':3,'requires_user_review':True,
+                'submissions':[{'command':'mkdir','stage':1,'passed':True},{'command':'mkdir','stage':2,'passed':True},
+                    {'command':'rmdir','stage':1,'passed':False}]}
+            summary=summarize_report(root,report)
+            self.assertEqual(summary['verified_count'],1)
+            self.assertEqual(len(summary['all_failed_submissions']),1)
+            self.assertFalse(summary['commands'][1]['account_progress_verified'])
+
+    def test_review_requires_actual_local_confirmation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            report={'requires_user_review':True,'error':'synthetic failure'}
+            args=argparse.Namespace(command='job',action='acknowledge',job_id='synthetic',reason='user requested review')
+            with patch('linuxstudio.job_path',return_value=root),patch('linuxstudio.current_report',return_value=report), \
+                 patch('tkinter.Tk'),patch('tkinter.messagebox.askyesno',return_value=False):
+                with self.assertRaises(RuntimeError):execute(args)
+            self.assertFalse((root/'acknowledged.json').exists())
+            with patch('linuxstudio.job_path',return_value=root),patch('linuxstudio.current_report',return_value=report), \
+                 patch('tkinter.Tk'),patch('tkinter.messagebox.askyesno',return_value=True) as confirm:
+                result=execute(args)
+                confirm.assert_called_once()
+            self.assertEqual(result['status'],'review_acknowledged')
+            self.assertTrue(json.loads((root/'acknowledged.json').read_text())['confirmed_locally'])
+
+    def test_lesson_receipts_cover_exact_account_and_topic(self):
+        from linuxstudio_common import save_lesson_receipt,load_lesson_evidence
+        with tempfile.TemporaryDirectory() as temp, patch('runtime_paths.DATA_DIR',Path(temp)):
+            lessons=[{'command':'head','topic':'1_130_head','url':'http://www.linuxstudio.cn/study/content/content_1_130_head.php',
+                      'text':'synthetic head tutorial'}]
+            receipt=save_lesson_receipt('synthetic',lessons)
+            self.assertEqual(len(load_lesson_evidence([receipt['id']],'synthetic',{'head':'1_130_head'})),1)
+            for user, topics in [('other',{'head':'1_130_head'}),('synthetic',{'tail':'1_140_tail'})]:
+                with self.assertRaises(ValueError):load_lesson_evidence([receipt['id']],user,topics)
 
     def test_job_verify_requires_every_command_complete(self):
         with tempfile.TemporaryDirectory() as temp:

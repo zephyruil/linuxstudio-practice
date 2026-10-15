@@ -71,7 +71,12 @@ def main():
     parser.add_argument('--reuse-only', action='store_true', help='Require the active session; never open or show a login window.')
     parser.add_argument('--report', type=Path, required=True)
     parser.add_argument('--control-file', type=Path, required=True)
+    parser.add_argument('--lesson-file', type=Path)
+    parser.add_argument('--max-errors', type=int, default=3)
+    parser.add_argument('--reviewed-failures-file',type=Path)
     args = parser.parse_args()
+    if args.max_errors < 1:
+        parser.error('--max-errors must be positive')
     available = json.loads(args.catalog_file.read_text(encoding='utf-8'))
     topics = {name: available[name] for name in args.commands}
     if any(not re.fullmatch(r'1_\d+_' + re.escape(name), topic) for name, topic in topics.items()):
@@ -80,7 +85,19 @@ def main():
               'run_id': str(uuid.uuid4()), 'commands': list(topics),
               'transport': 'Python requests.Session; HTTP only',
               'browser_foreground_used': False, 'password_saved': False,
-              'session_saved': False, 'submissions': [], 'completed_commands': []}
+              'session_saved': False, 'submissions': [], 'completed_commands': [],
+              'requested_command_count':len(topics), 'max_errors':args.max_errors,
+              'error_count':0, 'command_stage_counts':{},
+              'reviewed_previous_failed_jobs':json.loads(args.reviewed_failures_file.read_text(encoding='utf-8')) if args.reviewed_failures_file else [],
+              'lesson_evidence':json.loads(args.lesson_file.read_text(encoding='utf-8')) if args.lesson_file else []}
+    def check_halt():
+        halt = args.report.with_name('halt.json')
+        if halt.exists():
+            issue = json.loads(halt.read_text(encoding='utf-8'))
+            report['execution_issue'] = issue
+            raise RuntimeError('Execution stopped: ' + issue['reason'])
+        if args.report.with_name('cancel.json').exists():
+            raise RuntimeError('Job cancelled locally; completed submissions remain on the website.')
     try:
         with TimedSession() as session:
             task_started = time.perf_counter()
@@ -114,13 +131,14 @@ def main():
             report['account_progress_before'] = progress(session, topics)
             deadline = time.monotonic() + 1800
             while not all(c['complete'] for c in contexts):
+                check_halt()
                 pending = [parse_stage(c, args.login) for c in contexts if not c['complete']]
+                report['command_stage_counts'] = {c['name']:c['total'] for c in contexts}
                 report.update(status='awaiting_answers', pending=pending,
                               elapsed_after_login_seconds=round(time.perf_counter() - started, 3))
                 write_report(args.report, report)
                 while True:
-                    if args.report.with_name('cancel.json').exists():
-                        raise RuntimeError('Job cancelled locally; completed submissions remain on the website.')
+                    check_halt()
                     if time.monotonic() > deadline:
                         raise RuntimeError('Timed out waiting for local answers.')
                     try:
@@ -134,6 +152,7 @@ def main():
                 report['status'] = 'submitting'
                 write_report(args.report, report)
                 for context in contexts:
+                    check_halt()
                     if context['complete']:
                         continue
                     key = f"{context['name']}:{context['stage']}:{context['attempt']}"
@@ -166,6 +185,7 @@ def main():
                         next_step = page.select_one('form#form_prac input[name="step"]')
                         passed = next_step is not None and next_step.get('value') == str(context['stage'] + 1)
                     report['submissions'].append({'command': context['name'], 'stage': context['stage'],
+                        'total':context['total'],
                         'attempt': context['attempt'], 'task': context['task'], 'answer': answer,
                         'passed': passed, 'feedback': feedback, 'http_seconds': round(elapsed, 3)})
                     report.pop('in_flight', None)
@@ -178,9 +198,12 @@ def main():
                             context['stage'] += 1
                             context['attempt'] = 1
                     else:
+                        report['error_count'] += 1
+                        if report['error_count'] >= args.max_errors:
+                            report['stopped_by_error_budget'] = True
+                            raise RuntimeError('Error budget reached: ' + str(report['error_count']) +
+                                               '/' + str(args.max_errors) + '; human review required.')
                         context['attempt'] += 1
-                        if context['attempt'] > 5:
-                            raise RuntimeError('Repeated rejection; stopping for inspection.')
                     report['http_practice_seconds_total'] = round(network_seconds, 3)
                     write_report(args.report, report)
 
@@ -198,7 +221,12 @@ def main():
             report['status'] = 'complete'
             write_report(args.report, report)
     except Exception as exc:
-        report.update(status='error', error=str(exc))
+        report.update(status='error', error=str(exc), requires_user_review=True)
+        report['elapsed_total_seconds'] = round(time.perf_counter() - task_started, 3) if 'task_started' in locals() else 0
+        report['total_stages_passed'] = sum(s['passed'] for s in report['submissions'])
+        if 'contexts' in locals():
+            report['pending'] = [{'command':c['name'], 'stage':c['stage'],
+                'total':c.get('total'), 'task':c.get('task')} for c in contexts if not c['complete']]
         if report.get('in_flight'):
             report['submission_outcome_unknown'] = True
         write_report(args.report, report)
