@@ -1,0 +1,4 @@
+interface:
+  display_name: "LinuxStudio Practice"
+  short_description: "在本机登录 LinuxStudio，用 HTTP 完成授权练习并核验整项账号进度"
+  default_prompt: "使用 $linuxstudio-practice，复用本机登录，完成我指定的命令全部关卡并核验账号进度。"

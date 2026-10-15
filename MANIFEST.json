@@ -1,0 +1,29 @@
+{
+  "name": "linuxstudio-practice",
+  "version": "1.0.0",
+  "files": {
+    ".gitattributes": "d84b583e81d1e2e0742d6a168d94c9c05f67f4820cd7e2ba0a0006baf2e3402e",
+    ".github/workflows/tests.yml": "9064a609513a430027332fc0e08494b1ad722134833064ce90bd050440376c17",
+    ".gitignore": "afb44a6ec8b31b23698f05782a8b920bebded2dd5d484845e97194d9e4578f97",
+    "README.md": "2c787450c83ca42b9c20a5b1c4acdcad31dccc2fc87e4048651dbc99308d3985",
+    "install.cmd": "515e43d764df0aac7cb6d51011726e98e3a2ce5570933ec7333ff025dfc7c0ca",
+    "install.py": "19edce0fd4f341726e3d177069e7ccf0d1abe721a21b42be5182fb47b67f3dc6",
+    "linuxstudio-practice/SKILL.md": "ba647f20af5f9cef3180ef3cc54a437c34ec24e35264a0853a9bdad313b58678",
+    "linuxstudio-practice/agents/openai.yaml": "124ac44fd8eaf5eca479b6ade8771ff9b9974f1795597a620270496a09e07afd",
+    "linuxstudio-practice/references/cli.md": "17e9b83569618be86c3c0f72d4c8919c4f796f231f96646e657fd631931f32de",
+    "linuxstudio-practice/requirements.txt": "5d4ab415fff781f2ace5e8e654b6bd7b150d3ed0ebe22391a950ed18035a3bd1",
+    "linuxstudio-practice/run.cmd": "0c1206c1c108369a70ee7b8b0d4b9b7005201dd32b8f64e60627fcfbb32e774c",
+    "linuxstudio-practice/scripts/launcher.py": "61d9d92604531307a6df55ef6528834174fcad22a1ddecabebb3dd72ec1dc6de",
+    "linuxstudio-practice/scripts/linuxstudio.py": "bc7e98290674909053984979439eb54844d96bb635bac9206a2837e80284ac9c",
+    "linuxstudio-practice/scripts/linuxstudio_common.py": "edc7bbfd00f63e65ceeb8f805de4cca6c08429c9d2b0c089b37b46cdb0280c0c",
+    "linuxstudio-practice/scripts/linuxstudio_login.py": "dff201b6939f5b2823b71f3a9b89d93ded5b5cb6df0d10723a91f48679e04ed6",
+    "linuxstudio-practice/scripts/linuxstudio_session.py": "f94e8bbcd411da4c0c9f6dea4dae4a4f58bc5dff90e4cf81b913d7575aaa44ee",
+    "linuxstudio-practice/scripts/practice_worker.py": "196dcbb67e5e5917122ff436c4c9b667487f04e6878c85dbc05b48108821ad50",
+    "linuxstudio-practice/scripts/runtime_paths.py": "70f3d8f5d60e7c065a85acd272a52702f4e2f9b6d470190ea0790044e5d0bfe2",
+    "tests/test_distribution.py": "de364e0b1c99ff4e4d12aa752e4ee644b11e36a09cb1f4f53e2938c1ca022b3d",
+    "tests/test_linuxstudio_login.py": "65e25f50a8ba92ed8abbec9459d8c551f077a8e526f29aef401eedccffc2accb",
+    "tests/test_linuxstudio_session.py": "50dba4a755170435ff11de94709cbac02f2b5f5ba4939611dd9fc626c52b1436",
+    "tests/test_practice.py": "56854d404c0bdd44cae25f9f2f2d3eb50b4c70372744d571ea6efba46b74d0fe",
+    "tools/build.py": "b9c73979410bc5f901ec1dc14b6557513fa5be588f8a61671e9208d5a10414ec"
+  }
+}

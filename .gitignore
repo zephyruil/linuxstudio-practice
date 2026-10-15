@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.dpapi
+*.lock
+*.log
+.env*
+private/
+jobs/
+work/
+outputs/
+*.zip
+.linuxstudio-*/
