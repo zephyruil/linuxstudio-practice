@@ -626,6 +626,121 @@ class PracticeTests(unittest.TestCase):
             self.assertNotIn('submissions',result)
             self.assertNotIn('lesson_evidence',result)
 
+    def test_duplicate_failed_answer_blocks_whole_batch_without_budget_or_http(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            report={'status':'awaiting_answers','commands':['mkdir','rmdir'],'run_id':'synthetic-run',
+                'error_budget_scope':'command','max_errors':3,'error_count':2,
+                'command_error_counts':{'mkdir':2,'rmdir':0},
+                'pending':[{'key':'mkdir:1:3','command':'mkdir','stage':1,'task':'create a directory'},
+                           {'key':'rmdir:1:1','command':'rmdir','stage':1,'task':'remove a directory'}],
+                'submissions':[{'command':'mkdir','stage':1,'task':'create a directory','attempt':1,
+                    'answer':'mkdir wrong','passed':False,'feedback':'first rejected answer'},
+                    {'command':'mkdir','stage':1,'task':'create a directory','attempt':2,
+                     'answer':'mkdir other_wrong','passed':False,'feedback':'second rejected answer'}]}
+            (root/'report.json').write_text(json.dumps(report))
+            original_report=(root/'report.json').read_bytes()
+            (root/'control.json').write_text(json.dumps({'run_id':'synthetic-run','answers':{'mkdir:1:2':'mkdir other_wrong'}}))
+            original_control=(root/'control.json').read_bytes()
+            answers=root/'answers.json'
+            answers.write_text(json.dumps({'mkdir:1:3':'mkdir wrong','rmdir:1:1':'rmdir valid'}))
+            args=argparse.Namespace(command='job',action='submit',job_id='synthetic',answers_file=answers)
+            with patch('linuxstudio.job_path',return_value=root),patch('linuxstudio.current_report',return_value=report), \
+                 patch('linuxstudio.authenticated') as auth,patch('requests.sessions.Session.request') as request:
+                for _ in range(2):
+                    result=execute(args)
+                    self.assertEqual(result['status'],'needs_reanalysis')
+                    self.assertFalse(result['answers_queued'])
+                    self.assertFalse(result['practice_submitted'])
+                    self.assertFalse(result['judge_budget_consumed'])
+                    self.assertEqual(result['blocked_count'],1)
+                    self.assertEqual(result['blocked_answers'][0]['previous_attempt'],1)
+                    self.assertEqual(result['blocked_answers'][0]['feedback'],'first rejected answer')
+                auth.assert_not_called();request.assert_not_called()
+            self.assertEqual((root/'report.json').read_bytes(),original_report)
+            self.assertEqual((root/'control.json').read_bytes(),original_control)
+            self.assertFalse((root/'halt.json').exists())
+            summary=summarize_report(root,report)
+            self.assertEqual(summary['local_duplicate_block_count'],2)
+            self.assertEqual(summary['judge_error_count'],2)
+            self.assertEqual(summary['remaining_budget_per_command'],{'mkdir':1,'rmdir':3})
+            self.assertEqual(len(summary['local_duplicate_blocks']),2)
+            self.assertNotIn('feedback',summary['local_duplicate_blocks'][0]['blocked_answers'][0])
+
+    def test_duplicate_guard_requires_same_prompt_stage_command_and_failed_answer(self):
+        from linuxstudio import duplicate_failed_answers
+        pending={'key':'mkdir:2:3','command':'mkdir','stage':2,'task':'new task'}
+        failed={'command':'mkdir','stage':2,'task':'new task','answer':'mkdir a','attempt':1,
+                'passed':False,'feedback':'rejected'}
+        report={'pending':[pending],'submissions':[failed]}
+        self.assertEqual(len(duplicate_failed_answers(report,{'mkdir:2:3':'mkdir a'})),1)
+        for difference in ({'command':'rmdir'},{'stage':1},{'task':'old task'},{'passed':True}):
+            with self.subTest(difference=difference):
+                self.assertEqual(duplicate_failed_answers({**report,'submissions':[{**failed,**difference}]},
+                    {'mkdir:2:3':'mkdir a'}),[])
+        self.assertEqual(duplicate_failed_answers({**report,'submissions':[]},{'mkdir:2:3':'mkdir a'}),[])
+
+    def test_duplicate_guard_does_not_normalize_whitespace_case_or_shell_quotes(self):
+        from linuxstudio import duplicate_failed_answers
+        report={'pending':[{'key':'mkdir:1:2','command':'mkdir','stage':1,'task':'create a directory'}],
+            'submissions':[{'command':'mkdir','stage':1,'task':'create a directory','answer':'mkdir a',
+                            'attempt':1,'passed':False,'feedback':'rejected'}]}
+        for answer in ('mkdir  a','mkdir a ',' mkdir a','mkdir "a"','MKDIR a','mkdir a\n'):
+            with self.subTest(answer=answer):
+                self.assertEqual(duplicate_failed_answers(report,{'mkdir:1:2':answer}),[])
+
+    def test_after_local_block_other_commands_can_be_submitted_without_waiting(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            report={'status':'awaiting_answers','run_id':'synthetic-run','command_error_counts':{'mkdir':1,'rmdir':0},
+                'pending':[{'key':'mkdir:1:2','command':'mkdir','stage':1,'task':'create a directory'},
+                           {'key':'rmdir:1:1','command':'rmdir','stage':1,'task':'remove a directory'}],
+                'submissions':[{'command':'mkdir','stage':1,'task':'create a directory','attempt':1,
+                                'answer':'mkdir wrong','passed':False,'feedback':'rejected'}]}
+            (root/'report.json').write_text(json.dumps(report))
+            answers=root/'answers.json'
+            args=argparse.Namespace(command='job',action='submit',job_id='synthetic',answers_file=answers)
+            with patch('linuxstudio.job_path',return_value=root),patch('linuxstudio.current_report',return_value=report):
+                answers.write_text('{"mkdir:1:2":"mkdir wrong","rmdir:1:1":"rmdir valid"}')
+                self.assertEqual(execute(args)['status'],'needs_reanalysis')
+                self.assertFalse((root/'control.json').exists())
+                answers.write_text('{"rmdir:1:1":"rmdir valid"}')
+                self.assertEqual(execute(args)['status'],'answers_queued')
+            self.assertEqual(json.loads((root/'control.json').read_text())['answers'],{'rmdir:1:1':'rmdir valid'})
+            self.assertFalse((root/'halt.json').exists())
+
+    def test_revised_answer_still_requires_lesson_then_can_queue(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            report={'status':'awaiting_answers','run_id':'synthetic-run','command_error_counts':{'mkdir':1},
+                'pending':[{'key':'mkdir:1:2','command':'mkdir','stage':1,'task':'create a directory'}],
+                'submissions':[{'command':'mkdir','stage':1,'task':'create a directory','attempt':1,
+                                'answer':'mkdir wrong','passed':False,'feedback':'rejected'}]}
+            (root/'report.json').write_text(json.dumps(report))
+            answers=root/'answers.json';answers.write_text('{"mkdir:1:2":"mkdir -p correct/child"}')
+            args=argparse.Namespace(command='job',action='submit',job_id='synthetic',answers_file=answers)
+            with patch('linuxstudio.job_path',return_value=root),patch('linuxstudio.current_report',return_value=report):
+                self.assertEqual(execute(args)['status'],'needs_lesson')
+                self.assertFalse((root/'control.json').exists())
+                (root/'lessons.json').write_text('[{"lessons":[{"command":"mkdir"}]}]')
+                self.assertEqual(execute(args)['status'],'answers_queued')
+            self.assertFalse((root/'local_duplicate_blocks.json').exists())
+            self.assertEqual(json.loads((root/'control.json').read_text())['answers'],{'mkdir:1:2':'mkdir -p correct/child'})
+
+    def test_pending_lists_unique_rejected_answers_only_for_current_prompt(self):
+        from linuxstudio import pending_snapshot
+        item={'key':'mkdir:1:3','command':'mkdir','stage':1,'task':'current question'}
+        failed={'command':'mkdir','stage':1,'task':'current question','attempt':1,'answer':'mkdir wrong',
+                'passed':False,'feedback':'rejected'}
+        report={'status':'awaiting_answers','run_id':'synthetic-run','pending':[item],
+                'submissions':[failed,{**failed,'attempt':2},{**failed,'task':'different question','answer':'mkdir old'},
+                               {**failed,'stage':2,'answer':'mkdir another_stage'},
+                               {**failed,'passed':True,'answer':'mkdir passed'}]}
+        with tempfile.TemporaryDirectory() as temp:
+            result=pending_snapshot(Path(temp),report)
+        self.assertEqual(result['pending'][0]['rejected_answers'],['mkdir wrong'])
+        self.assertNotIn('rejected_answers',item)
+
 
 if __name__ == '__main__':
     unittest.main()

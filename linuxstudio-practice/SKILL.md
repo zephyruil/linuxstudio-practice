@@ -15,6 +15,8 @@ Use one fresh pending snapshot to build one UTF-8 JSON answer map for all confid
 
 Use pending's current tasks and `last_rejection` feedback to answer the next round. If status inspection is necessary, use `job status <id> --compact`; full status/history is for a specific unresolved problem or an explicit audit. Verify progress once at the end, not after each round. Keep detailed attempts in local reports and give concise progress updates; never reread old personal answer reports as a shortcut.
 
+Pending's `rejected_answers` lists exact answers already rejected for the same command, stage and unchanged prompt in this job. `job submit` blocks their reuse locally with `needs_reanalysis`: the entire submitted batch stays unqueued, no HTTP request is made, no judge budget is consumed, and the job remains awaiting answers. Reconsider the prompt/tutorial/feedback and revise the map, or submit only the other pending items so they can advance. Do not wait for a new round after a local block, loop on the same file, or vary formatting merely to bypass the check. If no justified alternative remains, explicitly defer that command with `job skip`. Local duplicate blocks are recorded separately from site rejections.
+
 ## Workflow
 
 1. Run `doctor` and `session status --verify`. Read-only operations and jobs never open login dialogs. If unavailable, report that fact. When local login is authorized, run `login`; the human enters the password locally. Never request a password in chat, command arguments, source files, logs, or environment variables. Never inspect browser cookies or profiles.

@@ -8,7 +8,7 @@ from urllib.parse import urljoin, urlsplit, parse_qs
 from bs4 import BeautifulSoup
 
 BASE = 'http://www.linuxstudio.cn'
-VERSION = '1.3.0'
+VERSION = '1.3.1'
 PROGRESS_NAMES = {
     'background_command': '前台后台相关命令：Ctrl+z、fg、bg、&、jobs',
     'zip': 'zip、unzip', 'gzip': 'gzip、gunzip', 'bzip2': 'bzip2、bunzip2',

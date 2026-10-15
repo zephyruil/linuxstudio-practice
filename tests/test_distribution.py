@@ -107,6 +107,47 @@ class DistributionTests(unittest.TestCase):
             self.assertFalse((directory/'halt.json').exists())
             self.assertFalse((root/'private').exists())
 
+    def test_real_cli_blocks_failed_answers_and_reports_local_counts_separately(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            job_id='00000000-0000-4000-8000-000000000002'
+            directory=root/'jobs'/job_id;directory.mkdir(parents=True)
+            commands=['mkdir','rmdir']
+            pending=[{'key':n+':1:2','command':n,'stage':1,'total':2,'task':'synthetic '+n+' task'} for n in commands]
+            failures=[{'command':p['command'],'stage':1,'task':p['task'],'attempt':1,
+                       'answer':p['command']+' wrong','passed':False,'feedback':'synthetic rejection'} for p in pending]
+            report={'status':'awaiting_answers','username':'synthetic','run_id':'synthetic-run',
+                'commands':commands,'error_budget_scope':'command','max_errors':3,'error_count':2,
+                'command_error_counts':{'mkdir':1,'rmdir':1},'pending':pending,'submissions':failures}
+            (directory/'report.json').write_text(json.dumps(report))
+            original=(directory/'report.json').read_bytes()
+            (directory/'worker.json').write_text(json.dumps({'pid':os.getpid()}))
+            answers=root/'answers.json'
+            answers.write_text(json.dumps({p['key']:p['command']+' wrong' for p in pending}))
+            env={**os.environ,'PYTHONUTF8':'1','LINUXSTUDIO_DATA_DIR':str(root)}
+            entry=[sys.executable,str(ROOT/'linuxstudio-practice/scripts/launcher.py')]
+            def call(*args):
+                result=subprocess.run([*entry,*args],env=env,capture_output=True,text=True,encoding='utf-8',timeout=10)
+                self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+                return json.loads(result.stdout)
+            result=call('job','submit',job_id,'--answers-file',str(answers))
+            self.assertEqual(result['status'],'needs_reanalysis')
+            self.assertEqual(result['blocked_count'],2)
+            self.assertFalse(result['judge_budget_consumed'])
+            self.assertFalse(result['answers_queued'])
+            self.assertEqual((directory/'report.json').read_bytes(),original)
+            snapshot=call('job','pending',job_id)
+            self.assertEqual(snapshot['status'],'awaiting_answers')
+            self.assertEqual(snapshot['pending'][0]['rejected_answers'],['mkdir wrong'])
+            summary=call('job','report',job_id)
+            self.assertEqual(summary['local_duplicate_block_count'],2)
+            self.assertEqual(len(summary['local_duplicate_blocks']),1)
+            self.assertEqual(summary['judge_error_count'],2)
+            self.assertEqual(summary['remaining_budget_per_command'],{'mkdir':2,'rmdir':2})
+            self.assertFalse((directory/'control.json').exists())
+            self.assertFalse((directory/'halt.json').exists())
+            self.assertFalse((root/'private').exists())
+
 
 if __name__ == '__main__':
     unittest.main()

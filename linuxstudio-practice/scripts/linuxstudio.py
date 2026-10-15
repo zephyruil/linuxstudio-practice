@@ -46,11 +46,15 @@ def summarize_report(directory, report):
     failures = [s for s in report.get('submissions',[]) if not s['passed']]
     counts = {name:sum(s['command']==name for s in failures) for name in report['commands']}
     scope = report.get('error_budget_scope','job')
+    blocks_path = directory / 'local_duplicate_blocks.json'
+    local_blocks = read_json(blocks_path) if blocks_path.exists() else []
     return {'job_id':directory.name, 'username':report.get('username'), 'status':report['status'],
         'worker_version':report.get('worker_version'),
         'requested_commands':report['commands'], 'requested_count':len(report['commands']),
         'verified_count':sum(i['account_progress_verified'] for i in items), 'commands':items,
         'max_errors':report.get('max_errors',3), 'judge_error_count':len(failures),
+        'local_duplicate_block_count':sum(len(event['blocked_answers']) for event in local_blocks),
+        'local_duplicate_blocks':local_blocks,
         'error_budget_scope':scope, 'command_error_counts':counts,
         'remaining_error_budget':max(0,report.get('max_errors',3)-len(failures)) if scope=='job' else None,
         'remaining_budget_per_command':{n:max(0,report.get('max_errors',3)-c) for n,c in counts.items()} if scope=='command' else {},
@@ -75,6 +79,28 @@ def validated_answers(report, answers):
         any(not isinstance(a, str) or not a.strip() or len(a) > 2000 for a in answers.values())):
         raise ValueError('Supply a nonempty JSON object of current pending keys to answer strings (max 2000 characters).')
     return {'run_id': report['run_id'], 'answers': answers}
+
+
+def rejected_for_prompt(report, item):
+    # Exact prompt/answer comparisons preserve shell whitespace and quoting semantics.
+    if not isinstance(item.get('task'), str):
+        return []
+    return [s for s in report.get('submissions', []) if s.get('passed') is False
+            and s.get('command') == item.get('command') and s.get('stage') == item.get('stage')
+            and s.get('task') == item['task']]
+
+
+def duplicate_failed_answers(report, answers):
+    blocked = []
+    for item in report['pending']:
+        if item['key'] not in answers:
+            continue
+        answer = answers[item['key']]
+        previous = next((s for s in reversed(rejected_for_prompt(report, item)) if s['answer'] == answer), None)
+        if previous is not None:
+            blocked.append({'key':item['key'], 'command':item['command'], 'stage':item['stage'],
+                'answer':answer, 'previous_attempt':previous['attempt'], 'feedback':previous['feedback']})
+    return blocked
 
 
 def current_report(directory):
@@ -123,6 +149,9 @@ def pending_snapshot(directory, report):
                      if s['command'] == item['command'] and s['stage'] == item['stage']), None)
         if last and not last['passed']:
             item['last_rejection'] = {k: last[k] for k in ('attempt', 'answer', 'feedback')}
+        rejected = rejected_for_prompt(report, item)
+        if rejected:
+            item['rejected_answers'] = list(dict.fromkeys(s['answer'] for s in rejected))
     return result
 
 
@@ -355,6 +384,18 @@ def execute(args):
                 except (ValueError, OSError) as exc:
                     halt_job(directory, 'invalid_answer_file_or_state', str(exc))
                     raise
+                blocked = duplicate_failed_answers(report, payload['answers'])
+                if blocked:
+                    path = directory / 'local_duplicate_blocks.json'
+                    events = read_json(path) if path.exists() else []
+                    events.append({'at':time.time(), 'run_id':report['run_id'],
+                        'blocked_answers':[{k:v for k,v in item.items() if k != 'feedback'} for item in blocked]})
+                    write_report(path, events)
+                    return {'status':'needs_reanalysis', 'blocked_answers':blocked, 'blocked_count':len(blocked),
+                        'answers_queued':False, 'practice_submitted':False, 'judge_budget_consumed':False,
+                        'next_action':'Nothing in this batch was queued. Reanalyze the prompt, tutorial and feedback; '
+                            'revise the rejected answers or submit only the other pending items. Do not repeat a '
+                            'known rejected answer or change formatting merely to bypass this check.'}
                 evidence = read_json(directory / 'lessons.json') if (directory / 'lessons.json').exists() else []
                 covered = {e['command'] for r in evidence for e in r['lessons']}
                 needs = {p['command'] for p in report['pending'] if p['key'] in payload['answers']
