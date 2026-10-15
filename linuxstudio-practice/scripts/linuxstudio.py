@@ -64,14 +64,14 @@ def authenticated(account=None, allow_prompt=False):
 
 def execute(args):
     from runtime_paths import DATA_DIR, JOBS_DIR
-    from linuxstudio_common import catalog, progress, write_report
+    from linuxstudio_common import BASE, catalog, progress, write_report, soup_for
     from linuxstudio_session import (SessionStore, window_status, window_running,
         start_window, atomic_write, LOGOUT_PATH)
     if args.command == 'doctor':
         import tkinter
         import requests
         import bs4
-        return {'version': '1.0.1', 'platform': sys.platform, 'python': sys.version.split()[0],
+        return {'version': '1.0.2', 'platform': sys.platform, 'python': sys.version.split()[0],
                 'supported': os.name == 'nt', 'data_dir': str(DATA_DIR),
                 'dependencies': {'requests': requests.__version__, 'beautifulsoup4': bs4.__version__,
                                  'tk': tkinter.TkVersion}, 'browser_required': False}
@@ -106,7 +106,7 @@ def execute(args):
             client.close()
             result.update(status='authenticated', username=auth.username, verified=True)
         return result
-    if args.command in ('catalog', 'progress'):
+    if args.command in ('catalog', 'progress', 'lesson'):
         client, auth = authenticated(args.account)
         with client:
             topics = catalog(client)
@@ -115,6 +115,20 @@ def execute(args):
             names = args.commands or list(topics)
             if not set(names).issubset(topics):
                 raise ValueError('Unknown command. Read catalog first.')
+            if args.command == 'lesson':
+                lessons = []
+                for name in names:
+                    url = BASE + '/study/content/content_' + topics[name] + '.php'
+                    page = soup_for(client.get(url, timeout=(10, 20)))
+                    for element in page.select('script, style'):
+                        element.decompose()
+                    body = page.select_one('#item') or page.body or page
+                    text = body.get_text('\n', strip=True)
+                    if not text.strip():
+                        raise RuntimeError('Empty lesson; inspect the tutorial link on the site.')
+                    lessons.append({'command':name, 'topic':topics[name], 'url':url, 'text':text})
+                return {'username':auth.username, 'source':'LinuxStudio own tutorials', 'lessons':lessons,
+                        'practice_submitted':False}
             return {'username': auth.username, 'progress': progress(client, names)}
     if args.command == 'job':
         if args.action == 'start':
@@ -196,11 +210,11 @@ def main(argv=None):
     session = commands.add_parser('session')
     session.add_argument('action', choices=['status', 'show', 'logout'])
     session.add_argument('--verify', action='store_true')
-    for name in ('catalog', 'progress'):
+    for name in ('catalog', 'progress', 'lesson'):
         item = commands.add_parser(name)
         item.add_argument('--account')
-        if name == 'progress':
-            item.add_argument('--commands', nargs='+')
+        if name in ('progress', 'lesson'):
+            item.add_argument('--commands', nargs='+', required=name == 'lesson')
     job = commands.add_parser('job').add_subparsers(dest='action', required=True)
     start = job.add_parser('start')
     start.add_argument('--commands', nargs='+', required=True)

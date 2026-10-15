@@ -194,6 +194,29 @@ class PracticeTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 job_path(value)
 
+    def test_lesson_fetches_catalog_topic_without_posting(self):
+        site = Site()
+        args = argparse.Namespace(command='lesson', commands=['head'], account=None)
+        with patch('linuxstudio.authenticated', return_value=(site, LoginResult('synthetic',False,False))), \
+             patch('linuxstudio_common.catalog', return_value={'head':'1_130_head'}), \
+             patch.object(site, 'get', return_value=Response('<div id="item">head 默认显示前10行<pre>head file</pre></div>')) as get:
+            result = execute(args)
+        self.assertFalse(result['practice_submitted'])
+        self.assertEqual(site.posts, [])
+        self.assertIn('前10行', result['lessons'][0]['text'])
+        self.assertEqual(result['lessons'][0]['url'], 'http://www.linuxstudio.cn/study/content/content_1_130_head.php')
+        get.assert_called_once_with(result['lessons'][0]['url'], timeout=(10,20))
+
+    def test_lesson_rejects_names_outside_catalog_before_fetch(self):
+        site = Site()
+        args = argparse.Namespace(command='lesson', commands=['../../private'], account=None)
+        with patch('linuxstudio.authenticated', return_value=(site, LoginResult('synthetic',False,False))), \
+             patch('linuxstudio_common.catalog', return_value={'head':'1_130_head'}), \
+             patch.object(site,'get') as get:
+            with self.assertRaises(ValueError):
+                execute(args)
+            get.assert_not_called()
+
     def test_job_verify_requires_every_command_complete(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

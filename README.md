@@ -32,7 +32,7 @@ $skill = Join-Path $HOME '.agents\skills\linuxstudio-practice'
 
 > 使用 $linuxstudio-practice，复用当前登录，完成 mkdir 的全部关卡，确认账号进度点亮并记录耗时。不占用浏览器前台；没有可复用会话时先告知我。
 
-调用流程：`catalog → job start → job pending → 生成答案 → job submit → 全部关卡 → job verify`。每个账号同时一个作业。命令、答案文件、取消和故障说明见 [CLI 参考](linuxstudio-practice/references/cli.md)。
+调用流程：`catalog → lesson（读取本站教程）→ job start → job pending → 生成答案 → job submit → 全部关卡 → job verify`。每个命令先读一次本站教程，首次被拒绝后对照教程和完整题目再修改答案。每个账号同时一个作业。命令、答案文件、取消和故障说明见 [CLI 参考](linuxstudio-practice/references/cli.md)。
 
 ## 运行数据
 
@@ -57,4 +57,4 @@ python tools/build.py
 
 `tools/build.py` 更新清单并以明确文件范围打包，禁止包含凭据、会话和个人记录。ZIP 默认在仓库外 `dist`，可显式指定目录。源码修改后须先重建清单再安装。清单用于完整性校验，不是作者签名。
 
-版本：1.0.1。修复 Windows 文件轮询期间的短暂占用：本地原子替换最多重试 10 秒，答案读取遇到临时 PermissionError 后继续等待。该重试仅针对本机文件，不重试 HTTP 提交。
+版本：1.0.2。新增 `lesson` 只读命令及先读本站教程的作答流程；保留 1.0.1 的 Windows 文件占用修复：本地原子替换最多重试 10 秒，答案读取遇到临时 PermissionError 后继续等待。该重试仅针对本机文件，不重试 HTTP 提交。
