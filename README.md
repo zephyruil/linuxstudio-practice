@@ -32,9 +32,9 @@ $skill = Join-Path $HOME '.agents\skills\linuxstudio-practice'
 
 > 使用 $linuxstudio-practice，复用当前登录，完成 mkdir 的全部关卡，确认账号进度点亮并记录耗时。不占用浏览器前台；没有可复用会话时先告知我。
 
-调用流程：`catalog → lesson（读取本站教程并保存凭据 ID）→ job start --lesson-receipts <ID> → job pending → 生成答案 → job submit → 全部关卡 → job verify → job report`。每个命令先读一次本站教程，首次被拒绝后对照教程和完整题目再修改答案。整个授权清单放在同一个作业，不分派给多个 Agent；数量由程序统计。
+调用流程：`catalog → job start → job pending → 常规题直接作答 → job submit → 完成或跳过卡住的命令 → job report`。不再预读全部教程。不熟悉的命令或首次判题失败时，才用 `lesson` 查该命令的相关部分，随后 `job attach-lessons` 附加获取凭据；同一命令后续关卡复用已读内容。整个授权清单放在一个作业，数量由程序统计。
 
-默认整个作业累计 **3 次判题失败即停**，通过一关不清零。工具异常、无效答案文件或并发冲突立即停止。停止后禁止自动重开绕过预算；新作业会被阻止。只有用户明确要求重试，才运行 `job acknowledge`，由用户在本机窗口确认审核；失败记录保留。`job report --verify-progress` 可在停止后只读核验已完成的部分，并保留所有拒绝、教程获取凭据及停止原因。完整命令和最终报告格式见 [CLI 参考](linuxstudio-practice/references/cli.md)。
+默认 **每个命令累计失败 3 次，就跳过该命令并继续其余项目**，不再因普通判题拒绝而整批停止。全部处理后，有跳过项则状态为 `partial`，最终集中报告卡关清单；不自动反复补做。教程无法获取等具体困难也可用 `job skip` 显式记录后继续。账号失效、提交超时结果未知、坏答案 JSON 或并发冲突仍会停止整批，且不自动重试 POST。仅这类执行异常需要人工审核恢复。`job report --verify-progress` 核验实际完成的部分，保留拒绝、跳过、教程凭据与失败历史。完整命令和报告格式见 [CLI 参考](linuxstudio-practice/references/cli.md)。
 
 ## 运行数据
 
@@ -59,4 +59,4 @@ python tools/build.py
 
 `tools/build.py` 更新清单并以明确文件范围打包，禁止包含凭据、会话和个人记录。ZIP 默认在仓库外 `dist`，可显式指定目录。源码修改后须先重建清单再安装。清单用于完整性校验，不是作者签名。
 
-版本：1.1.0。新增累计错误阈值、停止后人工审核、教程读取凭据和完整最终报告。调用变更：`job start` 必须带 `--lesson-receipts`，不能沿用 1.0.x 的无凭据启动方式。保留 Windows 文件占用的本地重试，不重试 HTTP 提交。
+版本：1.2.0。改为按需查教程、单命令阈值跳过并继续、`partial` 结果和手动跳过入口。`job start` 不再强制教程凭据；拒绝后重试才要求通过 `job attach-lessons` 附加相关凭据。保留 Windows 文件占用重试和关键执行异常的停机保护。

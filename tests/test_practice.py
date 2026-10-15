@@ -40,19 +40,20 @@ class Response:
 class Site:
     request_seconds = 0
     request_count = 0
-    def __init__(self, lit=True, wrong_account=False, reject=False, timeout=False):
+    def __init__(self, lit=True, wrong_account=False, reject=False, timeout=False, progress_names=None):
         self.headers = {}
         self.posts = []
         self.lit, self.wrong_account, self.reject, self.timeout = lit, wrong_account, reject, timeout
+        self.progress_names=progress_names or ['mkdir']
     def __enter__(self):
         return self
     def __exit__(self, *args):
         pass
     def get(self, url, **kwargs):
         if 'json_data' in url:
-            return Response(data={'data': [{'name': 'mkdir', 'value': 1}]})
+            return Response(data={'data': [{'name': n, 'value': 1} for n in self.progress_names]})
         if 'json_color' in url:
-            return Response(data=['#FE8463' if self.lit and len(self.posts) >= 2 else '#fcc3b4'])
+            return Response(data=['#FE8463' if self.lit and len(self.posts) >= 2 else '#fcc3b4']*len(self.progress_names))
         return Response(html(username='other' if self.wrong_account else 'synthetic'))
     def post(self, url, data, **kwargs):
         self.posts.append(dict(data))
@@ -66,7 +67,7 @@ class Site:
 
 
 class PracticeTests(unittest.TestCase):
-    def run_worker(self, site, transient_control_lock=False, commands=None, max_errors=3, halt_after_first=False):
+    def run_worker(self, site, transient_control_lock=False, commands=None, max_errors=3, halt_after_first=False, skip_initial=None):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             catalog = root / 'catalog.json'
@@ -87,6 +88,8 @@ class PracticeTests(unittest.TestCase):
                 if halt_after_first and len(value.get('submissions',[]))==1:
                     write_report(root/'halt.json',{'category':'concurrency_conflict','reason':'synthetic competing start'})
                 if value['status'] == 'awaiting_answers':
+                    if skip_initial:
+                        write_report(root/'skip_requests.json',{skip_initial:'synthetic tutorial unavailable'})
                     control.write_text(json.dumps({'run_id': value['run_id'],
                         'answers': {p['key']: 'mkdir synthetic_dir' for p in value['pending']}}), encoding='utf-8')
             argv = ['worker', '--reuse-only', '--login', 'synthetic', '--commands', *commands,
@@ -142,19 +145,23 @@ class PracticeTests(unittest.TestCase):
     def test_rejection_is_bounded_and_not_completion(self):
         site = Site(reject=True)
         code, report = self.run_worker(site)
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 0)
         self.assertEqual(len(site.posts), 3)
         self.assertEqual(report['error_count'],3)
-        self.assertTrue(report['stopped_by_error_budget'])
-        self.assertTrue(report['requires_user_review'])
+        self.assertEqual(report['status'],'partial')
+        self.assertEqual(report['skipped_commands'][0]['command'],'mkdir')
+        self.assertFalse(report['requires_user_review'])
+        self.assertFalse(report['account_progress_verified'])
         self.assertFalse(any(p['passed'] for p in report['submissions']))
 
-    def test_budget_is_cumulative_across_commands_not_per_command(self):
+    def test_budgets_are_per_command_and_all_skipped_commands_are_reported(self):
         site = Site(reject=True)
         code, report = self.run_worker(site, commands=['mkdir','rmdir'])
-        self.assertEqual(code,1)
-        self.assertEqual(len(site.posts),3)
-        self.assertEqual([s['command'] for s in report['submissions']], ['mkdir','rmdir','mkdir'])
+        self.assertEqual(code,0)
+        self.assertEqual(report['status'],'partial')
+        self.assertEqual(len(site.posts),6)
+        self.assertEqual(report['command_error_counts'],{'mkdir':3,'rmdir':3})
+        self.assertEqual(len(report['skipped_commands']),2)
         self.assertEqual(report['requested_command_count'],2)
 
     def test_success_between_errors_does_not_reset_budget(self):
@@ -167,15 +174,47 @@ class PracticeTests(unittest.TestCase):
             return original(url,data,**kwargs)
         site.post = alternating
         code, report = self.run_worker(site)
-        self.assertEqual(code,1)
+        self.assertEqual(code,0)
+        self.assertEqual(report['status'],'partial')
         self.assertEqual([s['passed'] for s in report['submissions']], [False,True,False,False])
         self.assertEqual(report['error_count'],3)
 
     def test_user_selected_lower_budget_is_enforced(self):
         site = Site(reject=True)
         code, report = self.run_worker(site,max_errors=1)
-        self.assertEqual(code,1)
+        self.assertEqual(code,0)
+        self.assertEqual(report['status'],'partial')
         self.assertEqual(len(site.posts),1)
+
+    def test_healthy_command_continues_after_other_command_is_skipped(self):
+        site=Site(progress_names=['mkdir','rmdir'])
+        original_get=site.get
+        def get(url,**kwargs):
+            return Response(html(total=4)) if 'topic=1_60_rmdir' in url else original_get(url,**kwargs)
+        def post(url,data,**kwargs):
+            site.posts.append(dict(data))
+            if url.endswith('mkdir'):
+                return Response(html(feedback='很遗憾'))
+            stage=int(data['step'])
+            return Response(html(stage=stage+1,total=4,feedback=f'通过了第 {stage} 关')) if stage<4 else Response(html(stage=4,total=4,feedback='成功通关'))
+        site.get=get;site.post=post
+        code,report=self.run_worker(site,commands=['mkdir','rmdir'])
+        self.assertEqual(code,0)
+        self.assertEqual(report['status'],'partial')
+        self.assertEqual(report['completed_commands'],['rmdir'])
+        self.assertEqual([p['step'] for p in site.posts][-2:],['3','4'])
+        self.assertTrue(report['completed_subset_progress_verified'])
+        self.assertFalse(report['account_progress_verified'])
+
+    def test_manual_skip_does_not_submit_that_command_or_block_others(self):
+        site=Site(progress_names=['mkdir','rmdir'])
+        code,report=self.run_worker(site,commands=['mkdir','rmdir'],skip_initial='mkdir')
+        self.assertEqual(code,0)
+        self.assertEqual(report['status'],'partial')
+        self.assertEqual(report['completed_commands'],['rmdir'])
+        self.assertEqual(len(site.posts),2)
+        self.assertEqual(report['error_count'],0)
+        self.assertEqual(report['skipped_commands'][0]['source'],'explicit_skip_request')
 
     def test_halt_is_checked_between_submissions_in_same_batch(self):
         site=Site()
@@ -364,6 +403,69 @@ class PracticeTests(unittest.TestCase):
             self.assertEqual(len(load_lesson_evidence([receipt['id']],'synthetic',{'head':'1_130_head'})),1)
             for user, topics in [('other',{'head':'1_130_head'}),('synthetic',{'tail':'1_140_tail'})]:
                 with self.assertRaises(ValueError):load_lesson_evidence([receipt['id']],user,topics)
+
+    def test_start_without_lessons_does_not_prefetch_or_block(self):
+        with tempfile.TemporaryDirectory() as temp,patch('runtime_paths.DATA_DIR',Path(temp)), \
+             patch('runtime_paths.JOBS_DIR',Path(temp)/'jobs'):
+            args=argparse.Namespace(command='job',action='start',commands=['mkdir'],account=None,lesson_receipts=[],max_errors=3)
+            site=Site()
+            with patch('linuxstudio.authenticated',return_value=(site,LoginResult('synthetic',False,False))), \
+                 patch('linuxstudio_common.catalog',return_value={'mkdir':'1_60_mkdir'}),patch('subprocess.Popen') as spawn, \
+                 patch.object(site,'get') as get:
+                spawn.return_value.pid=12345
+                result=execute(args)
+                get.assert_not_called()
+            self.assertEqual(result['lesson_evidence_count'],0)
+
+    def test_legacy_judge_budget_stop_no_longer_blocks_new_batch(self):
+        with tempfile.TemporaryDirectory() as temp,patch('runtime_paths.DATA_DIR',Path(temp)), \
+             patch('runtime_paths.JOBS_DIR',Path(temp)/'jobs'):
+            old=Path(temp)/'jobs/old';old.mkdir(parents=True)
+            (old/'report.json').write_text(json.dumps({'status':'error','username':'synthetic',
+                'requires_user_review':True,'stopped_by_error_budget':True,'error':'old global budget reached'}))
+            args=argparse.Namespace(command='job',action='start',commands=['mkdir'],account=None,lesson_receipts=[],max_errors=3)
+            with patch('linuxstudio.authenticated',return_value=(Site(),LoginResult('synthetic',False,False))), \
+                 patch('linuxstudio_common.catalog',return_value={'mkdir':'1_60_mkdir'}),patch('subprocess.Popen') as spawn:
+                spawn.return_value.pid=12345
+                result=execute(args)
+            history=json.loads(Path(result['report_path']).with_name('reviewed_failures.json').read_text())
+            self.assertIn('Legacy judge-only',history[0]['policy_note'])
+
+    def test_partial_terminal_job_is_not_marked_as_crashed(self):
+        from linuxstudio import current_report
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);(root/'report.json').write_text('{"status":"partial","commands":["mkdir"]}')
+            self.assertEqual(current_report(root)['status'],'partial')
+
+    def test_lessons_cannot_be_attached_after_batch_finished(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);report={'status':'partial','commands':['mkdir']}
+            args=argparse.Namespace(command='job',action='attach-lessons',job_id='synthetic',lesson_receipts=['synthetic'])
+            with patch('linuxstudio.job_path',return_value=root),patch('linuxstudio.current_report',return_value=report):
+                with self.assertRaisesRegex(RuntimeError,'not after completion'):execute(args)
+
+    def test_rejected_command_fetches_and_attaches_only_its_own_lesson(self):
+        from linuxstudio_common import save_lesson_receipt
+        with tempfile.TemporaryDirectory() as temp,patch('runtime_paths.DATA_DIR',Path(temp)):
+            root=Path(temp)/'job';root.mkdir()
+            report={'status':'awaiting_answers','commands':['mkdir','head'], 'username':'synthetic','run_id':'synthetic-run',
+                'command_error_counts':{'mkdir':1,'head':0},
+                'pending':[{'key':'mkdir:1:2','command':'mkdir'},{'key':'head:1:1','command':'head'}]}
+            (root/'report.json').write_text(json.dumps(report));(root/'lessons.json').write_text('[]')
+            (root/'catalog.json').write_text(json.dumps({'mkdir':'1_60_mkdir','head':'1_130_head'}))
+            answers=root/'answers.json';answers.write_text(json.dumps({'mkdir:1:2':'mkdir synthetic','head:1:1':'head file'}))
+            submit=argparse.Namespace(command='job',action='submit',job_id='synthetic',answers_file=answers)
+            with patch('linuxstudio.job_path',return_value=root),patch('linuxstudio.current_report',return_value=report):
+                result=execute(submit)
+                self.assertEqual(result['status'],'needs_lesson')
+                self.assertEqual(result['commands'],['mkdir'])
+                self.assertFalse((root/'halt.json').exists())
+                self.assertFalse((root/'control.json').exists())
+                receipt=save_lesson_receipt('synthetic',[{'command':'mkdir','topic':'1_60_mkdir',
+                    'url':'http://www.linuxstudio.cn/study/content/content_1_60_mkdir.php','text':'synthetic tutorial'}])
+                attach=argparse.Namespace(command='job',action='attach-lessons',job_id='synthetic',lesson_receipts=[receipt['id']])
+                self.assertEqual(execute(attach)['status'],'lessons_attached')
+                self.assertEqual(execute(submit)['status'],'answers_queued')
 
     def test_job_verify_requires_every_command_complete(self):
         with tempfile.TemporaryDirectory() as temp:

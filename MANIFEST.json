@@ -1,29 +1,29 @@
 {
   "name": "linuxstudio-practice",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "files": {
     ".gitattributes": "d84b583e81d1e2e0742d6a168d94c9c05f67f4820cd7e2ba0a0006baf2e3402e",
     ".github/workflows/tests.yml": "9064a609513a430027332fc0e08494b1ad722134833064ce90bd050440376c17",
     ".gitignore": "afb44a6ec8b31b23698f05782a8b920bebded2dd5d484845e97194d9e4578f97",
-    "README.md": "cbf66792d98b74e21227e63cdfddeef495a8830e2c5d172111e55dfd0449e4a1",
+    "README.md": "f2afb6c9dbd61704a97295f3724aa14c74db4c55080807357caefa13e6d3138a",
     "install.cmd": "515e43d764df0aac7cb6d51011726e98e3a2ce5570933ec7333ff025dfc7c0ca",
     "install.py": "19edce0fd4f341726e3d177069e7ccf0d1abe721a21b42be5182fb47b67f3dc6",
-    "linuxstudio-practice/SKILL.md": "0a66761ef88dcfc86cbafad29793ea1bce7bfef59774561e8ed88a9fc819943e",
+    "linuxstudio-practice/SKILL.md": "9810010b58293fbc81e2152b5c386f5c091900b9b38b5af30484d1e17125dc03",
     "linuxstudio-practice/agents/openai.yaml": "124ac44fd8eaf5eca479b6ade8771ff9b9974f1795597a620270496a09e07afd",
-    "linuxstudio-practice/references/cli.md": "f7d932917fe825d5e69b23904eff4e1733746cf62f86016192502c9cdd0b2277",
+    "linuxstudio-practice/references/cli.md": "03d3ce7ad01e9683e0f898e473438e6ad03e782229eee8e6057e9a21da47e9f6",
     "linuxstudio-practice/requirements.txt": "5d4ab415fff781f2ace5e8e654b6bd7b150d3ed0ebe22391a950ed18035a3bd1",
     "linuxstudio-practice/run.cmd": "0c1206c1c108369a70ee7b8b0d4b9b7005201dd32b8f64e60627fcfbb32e774c",
     "linuxstudio-practice/scripts/launcher.py": "61d9d92604531307a6df55ef6528834174fcad22a1ddecabebb3dd72ec1dc6de",
-    "linuxstudio-practice/scripts/linuxstudio.py": "81504ba749ad78549c48dd7e00fcd5f4398609cc8375cf33335f3f51032dc8ad",
-    "linuxstudio-practice/scripts/linuxstudio_common.py": "c23c3ae2815f74806eccea2840a04494bb21205201609024ee9e6b81fdc9b5ce",
+    "linuxstudio-practice/scripts/linuxstudio.py": "35933c8e0dbb046df341f1cfc16d8cf3ce5c266020bc4f121ced29d53160492f",
+    "linuxstudio-practice/scripts/linuxstudio_common.py": "8d2cffe77c1940a754d26c6bfa92b6d04869d19e1e56f72f831ebef000c9c92a",
     "linuxstudio-practice/scripts/linuxstudio_login.py": "dff201b6939f5b2823b71f3a9b89d93ded5b5cb6df0d10723a91f48679e04ed6",
     "linuxstudio-practice/scripts/linuxstudio_session.py": "cc430eb75e0b10cb9b3f94e1fcb42fb654d63872f01f48c55044ee881719eb3e",
-    "linuxstudio-practice/scripts/practice_worker.py": "1e109663e568bd3cf52e79f753cc6ed11e25d1adc2718997c04e26dc7d5e768e",
+    "linuxstudio-practice/scripts/practice_worker.py": "f0672f7edc6ac65fe905fbf199fdeb3890fa140bebb7705a0ff6f9665fa07774",
     "linuxstudio-practice/scripts/runtime_paths.py": "70f3d8f5d60e7c065a85acd272a52702f4e2f9b6d470190ea0790044e5d0bfe2",
     "tests/test_distribution.py": "0154d6507915b366cc6d9d6c6249ed715b8bbbdd7386aff008f3603db8e85796",
     "tests/test_linuxstudio_login.py": "65e25f50a8ba92ed8abbec9459d8c551f077a8e526f29aef401eedccffc2accb",
     "tests/test_linuxstudio_session.py": "90a99431b241a036cff6f5e009c206ef97cd844c97eb9df7321738a866059b5e",
-    "tests/test_practice.py": "5270b60dfae28cb81ac48135b9b46eef637fdf5e5264d2d2eb0d12cec765dc09",
-    "tools/build.py": "5ecf0b5063cf9a7fd4961e9b615553a4bfb080fbecff6e12aadf54510372888f"
+    "tests/test_practice.py": "32fae67602dc0176f28e5da375321db111918c683dd295670c909d24d82e3554",
+    "tools/build.py": "e3528a38aca49ef2812a422d85d7d29a533f56ed8347a5e269e8a438173fc2ab"
   }
 }

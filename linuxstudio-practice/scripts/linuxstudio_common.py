@@ -97,7 +97,7 @@ def save_lesson_receipt(username, lessons):
     return receipt
 
 
-def load_lesson_evidence(receipt_ids, username, topics):
+def load_lesson_evidence(receipt_ids, username, topics, require_all=True):
     records = []
     covered = set()
     for value in receipt_ids:
@@ -113,6 +113,6 @@ def load_lesson_evidence(receipt_ids, username, topics):
                 covered.add(name)
         records.append(receipt)
     missing = set(topics) - covered
-    if missing:
+    if missing and require_all:
         raise ValueError('Fetch lessons before starting; missing: ' + ', '.join(sorted(missing)))
     return records

@@ -6,7 +6,7 @@ from pathlib import Path
 import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
-VERSION = '1.1.0'
+VERSION = '1.2.0'
 SCRIPTS = ['launcher.py', 'linuxstudio.py', 'runtime_paths.py', 'linuxstudio_common.py',
            'linuxstudio_login.py', 'linuxstudio_session.py', 'practice_worker.py']
 FILES = ['README.md', 'install.py', 'install.cmd', '.gitignore', '.gitattributes',

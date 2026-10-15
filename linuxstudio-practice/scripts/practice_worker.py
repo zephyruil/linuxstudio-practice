@@ -87,7 +87,8 @@ def main():
               'browser_foreground_used': False, 'password_saved': False,
               'session_saved': False, 'submissions': [], 'completed_commands': [],
               'requested_command_count':len(topics), 'max_errors':args.max_errors,
-              'error_count':0, 'command_stage_counts':{},
+              'error_count':0, 'error_budget_scope':'command',
+              'command_error_counts':{n:0 for n in topics}, 'skipped_commands':[], 'command_stage_counts':{},
               'reviewed_previous_failed_jobs':json.loads(args.reviewed_failures_file.read_text(encoding='utf-8')) if args.reviewed_failures_file else [],
               'lesson_evidence':json.loads(args.lesson_file.read_text(encoding='utf-8')) if args.lesson_file else []}
     def check_halt():
@@ -98,6 +99,22 @@ def main():
             raise RuntimeError('Execution stopped: ' + issue['reason'])
         if args.report.with_name('cancel.json').exists():
             raise RuntimeError('Job cancelled locally; completed submissions remain on the website.')
+    def apply_skips():
+        path=args.report.with_name('skip_requests.json')
+        if not path.exists():
+            return False
+        requests=json.loads(path.read_text(encoding='utf-8'))
+        changed=False
+        for c in contexts:
+            if c['name'] in requests and not c['complete'] and not c['skipped']:
+                c['skipped']=True
+                last=next((s for s in reversed(report['submissions']) if s['command']==c['name']),{})
+                report['skipped_commands'].append({'command':c['name'],'stage':c['stage'],'total':c.get('total'),
+                    'task':c.get('task'),'last_answer':last.get('answer'),'feedback':last.get('feedback'),
+                    'error_count':report['command_error_counts'][c['name']], 'reason':requests[c['name']],
+                    'source':'explicit_skip_request'})
+                changed=True
+        return changed
     try:
         with TimedSession() as session:
             task_started = time.perf_counter()
@@ -126,19 +143,30 @@ def main():
                 page = soup_for(response)
                 verify_identity(page, args.login)
                 contexts.append({'name': name, 'url': url, 'page': page,
-                                 'stage': 1, 'attempt': 1, 'complete': False})
+                                 'stage': 1, 'attempt': 1, 'complete': False, 'skipped':False})
             report['authenticated'] = True
             report['account_progress_before'] = progress(session, topics)
             deadline = time.monotonic() + 1800
-            while not all(c['complete'] for c in contexts):
+            while not all(c['complete'] or c['skipped'] for c in contexts):
                 check_halt()
-                pending = [parse_stage(c, args.login) for c in contexts if not c['complete']]
+                if apply_skips():
+                    continue
+                if args.lesson_file:
+                    report['lesson_evidence'] = json.loads(args.lesson_file.read_text(encoding='utf-8'))
+                covered = {lesson['command'] for receipt in report['lesson_evidence'] for lesson in receipt['lessons']}
+                pending = [parse_stage(c, args.login) | {'needs_lesson':
+                    report['command_error_counts'][c['name']]>0 and c['name'] not in covered}
+                    for c in contexts if not c['complete'] and not c['skipped']]
                 report['command_stage_counts'] = {c['name']:c['total'] for c in contexts}
                 report.update(status='awaiting_answers', pending=pending,
                               elapsed_after_login_seconds=round(time.perf_counter() - started, 3))
                 write_report(args.report, report)
+                plan_changed=False
                 while True:
                     check_halt()
+                    if apply_skips():
+                        plan_changed=True
+                        break
                     if time.monotonic() > deadline:
                         raise RuntimeError('Timed out waiting for local answers.')
                     try:
@@ -149,11 +177,16 @@ def main():
                     if any(p['key'] in answers for p in pending):
                         break
                     time.sleep(0.1)
+                if plan_changed:
+                    continue
                 report['status'] = 'submitting'
+                if args.lesson_file:
+                    report['lesson_evidence'] = json.loads(args.lesson_file.read_text(encoding='utf-8'))
                 write_report(args.report, report)
                 for context in contexts:
                     check_halt()
-                    if context['complete']:
+                    apply_skips()
+                    if context['complete'] or context['skipped']:
                         continue
                     key = f"{context['name']}:{context['stage']}:{context['attempt']}"
                     if key not in answers:
@@ -199,26 +232,32 @@ def main():
                             context['attempt'] = 1
                     else:
                         report['error_count'] += 1
-                        if report['error_count'] >= args.max_errors:
-                            report['stopped_by_error_budget'] = True
-                            raise RuntimeError('Error budget reached: ' + str(report['error_count']) +
-                                               '/' + str(args.max_errors) + '; human review required.')
+                        report['command_error_counts'][context['name']] += 1
+                        if report['command_error_counts'][context['name']] >= args.max_errors:
+                            context['skipped'] = True
+                            report['skipped_commands'].append({'command':context['name'],
+                                'stage':context['stage'], 'total':context['total'],
+                                'task':context['task'], 'last_answer':answer, 'feedback':feedback,
+                                'error_count':report['command_error_counts'][context['name']],
+                                'reason':'Per-command rejection budget reached; deferred while other commands continue.'})
                         context['attempt'] += 1
                     report['http_practice_seconds_total'] = round(network_seconds, 3)
                     write_report(args.report, report)
 
             report['account_progress_after'] = progress(session, topics)
-            report['account_progress_verified'] = all(
-                report['account_progress_after'].get(name, {}).get('completed') for name in topics)
+            report['completed_subset_progress_verified'] = all(
+                report['account_progress_after'].get(name, {}).get('completed') for name in report['completed_commands'])
+            report['account_progress_verified'] = not report['skipped_commands'] and report['completed_subset_progress_verified']
             report['elapsed_after_login_seconds'] = round(time.perf_counter() - started, 3)
             report['elapsed_total_seconds'] = round(time.perf_counter() - task_started, 3)
             report['total_stages_passed'] = sum(s['passed'] for s in report['submissions'])
             report['http_request_seconds_total'] = round(session.request_seconds - baseline_http, 3)
             report['http_request_count'] = session.request_count - baseline_count
             report['pending'] = []
-            if not report['account_progress_verified']:
+            if not report['completed_subset_progress_verified']:
                 raise RuntimeError('All command stages passed, but account progress was not fully lit.')
-            report['status'] = 'complete'
+            report['status'] = 'partial' if report['skipped_commands'] else 'complete'
+            report['requires_user_review'] = False
             write_report(args.report, report)
     except Exception as exc:
         report.update(status='error', error=str(exc), requires_user_review=True)
@@ -226,7 +265,7 @@ def main():
         report['total_stages_passed'] = sum(s['passed'] for s in report['submissions'])
         if 'contexts' in locals():
             report['pending'] = [{'command':c['name'], 'stage':c['stage'],
-                'total':c.get('total'), 'task':c.get('task')} for c in contexts if not c['complete']]
+                'total':c.get('total'), 'task':c.get('task')} for c in contexts if not c['complete'] and not c['skipped']]
         if report.get('in_flight'):
             report['submission_outcome_unknown'] = True
         write_report(args.report, report)

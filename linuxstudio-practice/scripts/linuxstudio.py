@@ -44,11 +44,17 @@ def summarize_report(directory, report):
             'newly_lit':verified and report.get('account_progress_before',{}).get(name,{}).get('completed') is False,
             'next_stage':None if all_stages else len(passed)+1})
     failures = [s for s in report.get('submissions',[]) if not s['passed']]
+    counts = {name:sum(s['command']==name for s in failures) for name in report['commands']}
+    scope = report.get('error_budget_scope','job')
     return {'job_id':directory.name, 'username':report.get('username'), 'status':report['status'],
         'requested_commands':report['commands'], 'requested_count':len(report['commands']),
         'verified_count':sum(i['account_progress_verified'] for i in items), 'commands':items,
         'max_errors':report.get('max_errors',3), 'judge_error_count':len(failures),
-        'remaining_error_budget':max(0,report.get('max_errors',3)-len(failures)),
+        'error_budget_scope':scope, 'command_error_counts':counts,
+        'remaining_error_budget':max(0,report.get('max_errors',3)-len(failures)) if scope=='job' else None,
+        'remaining_budget_per_command':{n:max(0,report.get('max_errors',3)-c) for n,c in counts.items()} if scope=='command' else {},
+        'skipped_commands':report.get('skipped_commands',[]),
+        'skipped_count':len(report.get('skipped_commands',[])),
         'stopped_by_error_budget':report.get('stopped_by_error_budget',False),
         'stop_reason':report.get('error'), 'requires_user_review':report.get('requires_user_review',False),
         'execution_issue':report.get('execution_issue'),
@@ -74,7 +80,7 @@ def current_report(directory):
     from linuxstudio_common import write_report
     from linuxstudio_session import process_running
     report = read_json(directory / 'report.json')
-    if report.get('status') not in ('complete', 'error', 'cancelled'):
+    if report.get('status') not in ('complete', 'partial', 'error', 'cancelled'):
         try:
             alive = process_running(read_json(directory / 'worker.json')['pid'])
         except (OSError, KeyError, ValueError):
@@ -108,7 +114,7 @@ def execute(args):
         import tkinter
         import requests
         import bs4
-        return {'version': '1.1.0', 'platform': sys.platform, 'python': sys.version.split()[0],
+        return {'version': '1.2.0', 'platform': sys.platform, 'python': sys.version.split()[0],
                 'supported': os.name == 'nt', 'data_dir': str(DATA_DIR),
                 'dependencies': {'requests': requests.__version__, 'beautifulsoup4': bs4.__version__,
                                  'tk': tkinter.TkVersion}, 'browser_required': False}
@@ -179,7 +185,7 @@ def execute(args):
             if not set(args.commands).issubset(topics):
                 raise ValueError('Unknown command. Read catalog first.')
             selected = {n:topics[n] for n in args.commands}
-            lessons = load_lesson_evidence(args.lesson_receipts, auth.username, selected)
+            lessons = load_lesson_evidence(args.lesson_receipts, auth.username, selected, require_all=False)
             # Serialize creation; a second worker must not race the same PHP exercise.
             with SessionStore(JOBS_DIR / 'creation').locked():
                 reviewed = []
@@ -188,13 +194,18 @@ def execute(args):
                     if previous.get('username') != auth.username:
                         continue
                     if previous.get('requires_user_review'):
+                        if (previous.get('stopped_by_error_budget') and not previous.get('execution_issue')
+                                and not previous.get('submission_outcome_unknown')):
+                            reviewed.append({'job_id':old.parent.name, 'status':previous['status'],
+                                'error':previous.get('error'), 'policy_note':'Legacy judge-only stop is deferred under v1.2; original record retained.'})
+                            continue
                         if not (old.parent / 'acknowledged.json').exists():
                             raise RuntimeError('A previous job requires human review: ' + old.parent.name +
                                 '. Do not restart to reset the error budget. Ask the user first.')
                         reviewed.append({'job_id':old.parent.name, 'status':previous['status'],
                             'error':previous.get('error'), 'error_count':previous.get('error_count'),
                             'acknowledgment':read_json(old.parent / 'acknowledged.json')})
-                    if (previous.get('status') not in ('complete', 'error', 'cancelled') and
+                    if (previous.get('status') not in ('complete', 'partial', 'error', 'cancelled') and
                         previous.get('username') == auth.username):
                         halt_job(old.parent, 'concurrency_conflict', 'Another job start was attempted for the same account.')
                         raise RuntimeError('Concurrent job start blocked; existing job halted for human review: ' + old.parent.name)
@@ -219,13 +230,37 @@ def execute(args):
             return {'job_id': job_id, 'status': 'starting', 'username': auth.username,
                     'requested_command_count':len(args.commands), 'commands':args.commands,
                     'max_errors':args.max_errors, 'lesson_evidence_count':len(lessons),
+                    'error_budget_scope':'command',
                     'report_path': str(directory / 'report.json')}
         directory = job_path(args.job_id)
         report = current_report(directory)
         if args.action == 'status':
             return report
         if args.action == 'pending':
-            return {k: report.get(k) for k in ('status', 'username', 'run_id', 'pending', 'error', 'error_count', 'max_errors')}
+            return {k: report.get(k) for k in ('status', 'username', 'run_id', 'pending', 'error', 'error_count', 'max_errors',
+                                              'command_error_counts','skipped_commands')}
+        if args.action == 'attach-lessons':
+            if report['status']!='awaiting_answers':
+                raise RuntimeError('Attach lessons while the job is awaiting answers, not after completion.')
+            with SessionStore(directory / 'lesson_update').locked():
+                topics = read_json(directory / 'catalog.json')
+                records = load_lesson_evidence(args.lesson_receipts, report['username'],topics,require_all=False)
+                existing = read_json(directory / 'lessons.json')
+                combined = {r['id']:r for r in [*existing,*records]}
+                write_report(directory / 'lessons.json',list(combined.values()))
+            return {'status':'lessons_attached','receipt_ids':list(combined),'practice_submitted':False}
+        if args.action == 'skip':
+            if report['status']!='awaiting_answers':
+                raise RuntimeError('Wait until the job is awaiting answers before deferring commands.')
+            pending={p['command'] for p in report['pending']}
+            if not args.reason.strip() or not set(args.commands).issubset(pending):
+                raise ValueError('Provide pending command names and a nonempty deferral reason.')
+            with SessionStore(directory/'skip_update').locked():
+                path=directory/'skip_requests.json'
+                requests=read_json(path) if path.exists() else {}
+                requests.update({name:args.reason for name in args.commands})
+                write_report(path,requests)
+            return {'status':'skip_requested','commands':args.commands,'reason':args.reason,'practice_submitted':False}
         if args.action == 'acknowledge':
             if not report.get('requires_user_review'):
                 raise RuntimeError('No stopped job requires acknowledgment.')
@@ -251,7 +286,7 @@ def execute(args):
                 write_report(directory / 'verification.json', {'username':auth.username,'progress':current,'at':time.time()})
             return summarize_report(directory, report)
         if args.action == 'cancel':
-            if report.get('status') in ('complete', 'error', 'cancelled'):
+            if report.get('status') in ('complete', 'partial', 'error', 'cancelled'):
                 return {'status': report['status'], 'job_id': args.job_id}
             write_report(directory / 'cancel.json', {'cancelled': True})
             return {'status': 'cancellation_requested', 'job_id': args.job_id}
@@ -263,6 +298,13 @@ def execute(args):
                 except (ValueError, OSError) as exc:
                     halt_job(directory, 'invalid_answer_file_or_state', str(exc))
                     raise
+                evidence = read_json(directory / 'lessons.json') if (directory / 'lessons.json').exists() else []
+                covered = {e['command'] for r in evidence for e in r['lessons']}
+                needs = {p['command'] for p in report['pending'] if p['key'] in payload['answers']
+                    and report.get('command_error_counts',{}).get(p['command'],0)>0 and p['command'] not in covered}
+                if needs:
+                    return {'status':'needs_lesson','commands':sorted(needs),'practice_submitted':False,
+                        'next_action':'Fetch only these lessons, attach their receipt IDs, then resubmit. The job is still waiting.'}
                 control = directory / 'control.json'
                 if control.exists():
                     old = read_json(control)
@@ -306,9 +348,9 @@ def main(argv=None):
     start = job.add_parser('start')
     start.add_argument('--commands', nargs='+', required=True)
     start.add_argument('--account')
-    start.add_argument('--lesson-receipts',nargs='+',required=True)
-    start.add_argument('--max-errors',type=int,default=3)
-    for name in ('status', 'pending', 'submit', 'verify', 'cancel', 'report', 'acknowledge'):
+    start.add_argument('--lesson-receipts',nargs='+',default=[])
+    start.add_argument('--max-errors',type=int,default=3,help='Total judge rejections per command before deferring it.')
+    for name in ('status', 'pending', 'submit', 'verify', 'cancel', 'report', 'acknowledge','attach-lessons','skip'):
         item = job.add_parser(name)
         item.add_argument('job_id')
         if name == 'submit':
@@ -316,6 +358,11 @@ def main(argv=None):
         elif name == 'report':
             item.add_argument('--verify-progress',action='store_true')
         elif name == 'acknowledge':
+            item.add_argument('--reason',required=True)
+        elif name == 'attach-lessons':
+            item.add_argument('--lesson-receipts',nargs='+',required=True)
+        elif name == 'skip':
+            item.add_argument('--commands',nargs='+',required=True)
             item.add_argument('--reason',required=True)
     args = parser.parse_args(argv)
     if args.command == 'job' and args.action == 'start' and args.max_errors < 1:
