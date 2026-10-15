@@ -149,6 +149,17 @@ class PracticeTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 progress(site, ['mkdir'])
 
+    def test_progress_uses_actual_combined_site_labels(self):
+        from linuxstudio_common import PROGRESS_NAMES
+        names = ['background_command', 'zip', 'gzip', 'bzip2', 'pbzip2']
+        site = Site()
+        data = {'data': [{'name': PROGRESS_NAMES[n]} for n in names]}
+        with patch.object(site, 'get', side_effect=[Response(data=data), Response(data=['#FE8463'] * len(names))]):
+            result = progress(site, names)
+        self.assertEqual(set(result), set(names))
+        self.assertTrue(all(item['completed'] for item in result.values()))
+        self.assertEqual(result['zip']['site_progress_name'], 'zip、unzip')
+
     def test_stale_or_invalid_answers_rejected(self):
         report = {'status': 'awaiting_answers', 'run_id': 'synthetic-run', 'pending': [{'key':'mkdir:2:1'}]}
         self.assertEqual(validated_answers(report, {'mkdir:2:1':'mkdir a'})['run_id'], 'synthetic-run')

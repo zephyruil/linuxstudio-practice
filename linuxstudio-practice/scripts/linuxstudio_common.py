@@ -5,6 +5,11 @@ from urllib.parse import urljoin, urlsplit, parse_qs
 from bs4 import BeautifulSoup
 
 BASE = 'http://www.linuxstudio.cn'
+PROGRESS_NAMES = {
+    'background_command': '前台后台相关命令：Ctrl+z、fg、bg、&、jobs',
+    'zip': 'zip、unzip', 'gzip': 'gzip、gunzip', 'bzip2': 'bzip2、bunzip2',
+    'pbzip2': 'pbzip2、pbunzip2', 'ftp': 'ftp、lftp', 'who': 'who、w',
+}
 
 
 def soup_for(response):
@@ -59,5 +64,12 @@ def progress(session, topics):
     entries, color_list = values.json()['data'], colors.json()
     if not isinstance(entries, list) or not isinstance(color_list, list) or len(entries) != len(color_list):
         raise RuntimeError('Progress data and colors do not match.')
-    return {entry['name']: {'color': color_list[i], 'completed': color_list[i].upper() == '#FE8463'}
-            for i, entry in enumerate(entries) if entry.get('name') in topics}
+    by_name = {entry['name']: color_list[i] for i, entry in enumerate(entries)}
+    result = {}
+    for name in topics:
+        label = PROGRESS_NAMES.get(name, name)
+        if label in by_name:
+            color = by_name[label]
+            result[name] = {'color': color, 'completed': color.upper() == '#FE8463',
+                            'site_progress_name': label}
+    return result
