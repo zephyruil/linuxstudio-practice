@@ -66,12 +66,20 @@ class Site:
 
 
 class PracticeTests(unittest.TestCase):
-    def run_worker(self, site):
+    def run_worker(self, site, transient_control_lock=False):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             catalog = root / 'catalog.json'
             catalog.write_text('{"mkdir":"1_60_mkdir"}', encoding='utf-8')
             report, control = root / 'report.json', root / 'control.json'
+            original_read = Path.read_text
+            denied = False
+            def read_after_unlock(path, *args, **kwargs):
+                nonlocal denied
+                if transient_control_lock and path == control and not denied:
+                    denied = True
+                    raise PermissionError('synthetic transient reader conflict')
+                return original_read(path, *args, **kwargs)
             from linuxstudio_common import write_report
             def answer_pending(path, value):
                 write_report(path, value)
@@ -82,8 +90,11 @@ class PracticeTests(unittest.TestCase):
                     '--catalog-file', str(catalog), '--report', str(report), '--control-file', str(control)]
             with patch.object(sys, 'argv', argv), patch.object(worker, 'TimedSession', return_value=site), \
                  patch('linuxstudio_session.attach_session', return_value=LoginResult('synthetic', False, False)), \
+                 patch.object(Path, 'read_text', read_after_unlock), \
                  patch.object(worker, 'write_report', side_effect=answer_pending):
                 code = worker.main()
+            if transient_control_lock:
+                self.assertTrue(denied)
             return code, json.loads(report.read_text(encoding='utf-8'))
 
     def test_all_stages_real_fields_and_account_progress(self):
@@ -116,6 +127,13 @@ class PracticeTests(unittest.TestCase):
         self.assertEqual(len(site.posts), 1)
         self.assertEqual(report['completed_commands'], [])
         self.assertTrue(report['submission_outcome_unknown'])
+
+    def test_transient_control_read_denial_does_not_abort_or_repeat_post(self):
+        site = Site()
+        code, report = self.run_worker(site, transient_control_lock=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(report['status'], 'complete')
+        self.assertEqual([p['step'] for p in site.posts], ['1', '2'])
 
     def test_rejection_is_bounded_and_not_completion(self):
         site = Site(reject=True)

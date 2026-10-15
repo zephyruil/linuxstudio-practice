@@ -39,10 +39,23 @@ def atomic_write(path, data):
         with tempfile.NamedTemporaryFile(dir=path.parent, suffix='.tmp', delete=False) as f:
             temporary = Path(f.name)
             f.write(data)
-        temporary.replace(path)
+        # Windows readers can briefly hold a handle without FILE_SHARE_DELETE.
+        # Retry only the local rename; never retry any HTTP submission here.
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                temporary.replace(path)
+                break
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
     finally:
         if temporary is not None and temporary.exists():
-            temporary.unlink()
+            try:
+                temporary.unlink()
+            except PermissionError:
+                pass  # Do not hide the original failure if a scanner holds it.
 
 
 class SessionStore:

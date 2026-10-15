@@ -71,7 +71,7 @@ def execute(args):
         import tkinter
         import requests
         import bs4
-        return {'version': '1.0.0', 'platform': sys.platform, 'python': sys.version.split()[0],
+        return {'version': '1.0.1', 'platform': sys.platform, 'python': sys.version.split()[0],
                 'supported': os.name == 'nt', 'data_dir': str(DATA_DIR),
                 'dependencies': {'requests': requests.__version__, 'beautifulsoup4': bs4.__version__,
                                  'tk': tkinter.TkVersion}, 'browser_required': False}

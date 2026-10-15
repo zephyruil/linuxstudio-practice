@@ -32,7 +32,7 @@ class DistributionTests(unittest.TestCase):
                 self.assertFalse(any(any(segment in name for segment in
                     ('__pycache__', '.dpapi', '/private/', '/jobs/', '.venv', '.git/')) for name in names))
                 archive.extractall(temp / 'unpacked')
-            unpacked = temp / 'unpacked/linuxstudio-practice-v1.0.0'
+            unpacked = temp / 'unpacked' / Path(built['archive']).stem
             manifest = json.loads((unpacked / 'MANIFEST.json').read_text(encoding='utf-8'))
             for name, digest in manifest['files'].items():
                 self.assertEqual(hashlib.sha256((unpacked / name).read_bytes()).hexdigest(), digest)
@@ -49,6 +49,7 @@ class DistributionTests(unittest.TestCase):
             entry = [sys.executable, str(skill / 'scripts/launcher.py')]
             doctor = subprocess.run([*entry, 'doctor'], env=env, capture_output=True, text=True, encoding='utf-8', check=True)
             self.assertTrue(json.loads(doctor.stdout)['supported'])
+            self.assertEqual(json.loads(doctor.stdout)['version'], manifest['version'])
             self.assertEqual(json.loads(doctor.stdout)['data_dir'], str(state.resolve()))
             # Missing session: no UI, no account data created, immediate failure.
             reuse = subprocess.run([*entry, 'session', 'status', '--verify'], env=env,

@@ -125,7 +125,7 @@ def main():
                         raise RuntimeError('Timed out waiting for local answers.')
                     try:
                         control = json.loads(args.control_file.read_text(encoding='utf-8-sig'))
-                    except (FileNotFoundError, json.JSONDecodeError):
+                    except (FileNotFoundError, PermissionError, json.JSONDecodeError):
                         control = {}
                     answers = control.get('answers', {}) if control.get('run_id') == report['run_id'] else {}
                     if any(p['key'] in answers for p in pending):

@@ -8,7 +8,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'linuxstudio-practice' / 'scripts'))
 import requests
 from linuxstudio_login import LoginResult
-from linuxstudio_session import SessionStore, SessionGuard, restore, attach_session, BASE
+from linuxstudio_session import SessionStore, SessionGuard, restore, attach_session, BASE, atomic_write
 
 
 class PersistentSessionTests(unittest.TestCase):
@@ -138,6 +138,50 @@ class PersistentSessionTests(unittest.TestCase):
             result = attach_session(self.owner, 'synthetic_account', allow_prompt=False)
             self.assertTrue(result.session_reused)
             start.assert_not_called()
+
+    def test_atomic_write_recovers_after_windows_reader_releases_file(self):
+        import ctypes
+        import threading
+        path = Path(self.temp.name) / 'control.json'
+        path.write_bytes(b'old complete content')
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
+                                      ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+        kernel.CreateFileW.restype = ctypes.c_void_p
+        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        # Permit reading/writing but not delete sharing, reproducing Windows'
+        # denial of rename-over-open-file while a poller is reading it.
+        handle = kernel.CreateFileW(str(path), 0x80000000, 0x3, None, 3, 0, None)
+        self.assertNotIn(handle, (None, ctypes.c_void_p(-1).value))
+        try:
+            with self.assertRaises(PermissionError):
+                candidate = path.with_suffix('.probe')
+                candidate.write_bytes(b'probe')
+                candidate.replace(path)
+            candidate.unlink()
+        except BaseException:
+            kernel.CloseHandle(handle)
+            raise
+        release = threading.Timer(0.15, lambda: kernel.CloseHandle(handle))
+        release.start()
+        try:
+            atomic_write(path, b'new complete content')
+        finally:
+            release.join()
+        self.assertEqual(path.read_bytes(), b'new complete content')
+        self.assertEqual(list(path.parent.glob('*.tmp')), [])
+
+    def test_atomic_write_permanent_denial_is_bounded_and_keeps_original(self):
+        path = Path(self.temp.name) / 'control.json'
+        path.write_bytes(b'original')
+        with patch('pathlib.Path.replace', side_effect=PermissionError('synthetic locked destination')) as replace, \
+             patch('linuxstudio_session.time.monotonic', side_effect=[0, 0.1, 10]), \
+             patch('linuxstudio_session.time.sleep'):
+            with self.assertRaises(PermissionError):
+                atomic_write(path, b'replacement')
+            self.assertEqual(replace.call_count, 2)
+        self.assertEqual(path.read_bytes(), b'original')
+        self.assertEqual(list(path.parent.glob('*.tmp')), [])
 
 
 if __name__ == '__main__':

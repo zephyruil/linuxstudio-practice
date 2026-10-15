@@ -6,6 +6,7 @@ from pathlib import Path
 import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
+VERSION = '1.0.1'
 SCRIPTS = ['launcher.py', 'linuxstudio.py', 'runtime_paths.py', 'linuxstudio_common.py',
            'linuxstudio_login.py', 'linuxstudio_session.py', 'practice_worker.py']
 FILES = ['README.md', 'install.py', 'install.cmd', '.gitignore', '.gitattributes',
@@ -29,14 +30,14 @@ def build(output):
         if b'C:\\Users\\' in content or b'D:\\Anaconda' in content:
             raise RuntimeError('Machine-specific path in ' + name)
         hashes[name] = hashlib.sha256(content).hexdigest()
-    manifest = {'name': 'linuxstudio-practice', 'version': '1.0.0', 'files': hashes}
+    manifest = {'name': 'linuxstudio-practice', 'version': VERSION, 'files': hashes}
     (ROOT / 'MANIFEST.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    archive = output / 'linuxstudio-practice-v1.0.0.zip'
+    archive = output / f'linuxstudio-practice-v{VERSION}.zip'
     with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as package:
         for name in [*sorted(FILES), 'MANIFEST.json']:
-            package.write(ROOT / name, 'linuxstudio-practice-v1.0.0/' + name)
+            package.write(ROOT / name, f'linuxstudio-practice-v{VERSION}/' + name)
     return {'archive': str(archive), 'files': len(FILES) + 1,
             'sha256': hashlib.sha256(archive.read_bytes()).hexdigest()}
 

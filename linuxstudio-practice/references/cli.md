@@ -42,3 +42,15 @@ Reports live in `<data-dir>\jobs\<UUID>`, containing account, prompts, answers, 
 Private files: `<data-dir>\private\accounts.dpapi` and `active_session.dpapi`, scoped to the current Windows user. Do not publish or move them to another user. Closing a client leaves the owner logged in. Stopping the owner process is not a website logout; the next authorized login can recover its encrypted session. **退出登录** invalidates the generation, clears retained Cookies and requests server logout.
 
 If HTML/JSON schema changes, fail and inspect the live form; never spoof passing results. Only Linux chapter color `#FE8463` is supported in v1; other chapters require their own adapter and tests.
+
+## Rejected answers and local file contention
+
+A valid shell equivalent may be rejected by the site's limited answer matcher. Read the full task, preserve its exact filenames and absolute paths, then compare the course's syntax before spending another attempt. Previously verified examples (only for matching tasks):
+
+- Enter the physical target of the `seq` symlink: `cd -P seq`.
+- Remove the home directory's `tmp` and its empty child `raw` while elsewhere: `rmdir -p ~/tmp/raw`. Both the home prefix and removal of parent directories matter.
+- Display ten lines from a gzip file: `zcat <the task's exact file path> | head`, or `| tail` for the final ten. These commands default to ten lines; the site may reject an equivalent explicit count.
+
+These are troubleshooting examples, not a substitute for reading the current prompt. Do not assume an unseen rejected command had the same path or meaning.
+
+On Windows, a polling reader can temporarily prevent atomic file replacement. Version 1.0.1 retries local replacement for at most ten seconds and lets the worker wait through a transient denied control-file read. Permanent write errors still surface and leave the previous target intact. This never retries an HTTP POST. No live exercise submissions are needed to test file contention.
