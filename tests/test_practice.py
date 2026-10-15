@@ -151,7 +151,7 @@ class PracticeTests(unittest.TestCase):
 
     def test_progress_uses_actual_combined_site_labels(self):
         from linuxstudio_common import PROGRESS_NAMES
-        names = ['background_command', 'zip', 'gzip', 'bzip2', 'pbzip2']
+        names = ['background_command', 'zip', 'gzip', 'bzip2', 'pbzip2', 'ftp', 'who_w', 'pipeline']
         site = Site()
         data = {'data': [{'name': PROGRESS_NAMES[n]} for n in names]}
         with patch.object(site, 'get', side_effect=[Response(data=data), Response(data=['#FE8463'] * len(names))]):
@@ -159,6 +159,8 @@ class PracticeTests(unittest.TestCase):
         self.assertEqual(set(result), set(names))
         self.assertTrue(all(item['completed'] for item in result.values()))
         self.assertEqual(result['zip']['site_progress_name'], 'zip、unzip')
+        self.assertEqual(result['who_w']['site_progress_name'], 'who、w')
+        self.assertEqual(result['pipeline']['site_progress_name'], '管道')
 
     def test_stale_or_invalid_answers_rejected(self):
         report = {'status': 'awaiting_answers', 'run_id': 'synthetic-run', 'pending': [{'key':'mkdir:2:1'}]}

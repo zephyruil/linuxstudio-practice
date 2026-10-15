@@ -8,7 +8,8 @@ BASE = 'http://www.linuxstudio.cn'
 PROGRESS_NAMES = {
     'background_command': '前台后台相关命令：Ctrl+z、fg、bg、&、jobs',
     'zip': 'zip、unzip', 'gzip': 'gzip、gunzip', 'bzip2': 'bzip2、bunzip2',
-    'pbzip2': 'pbzip2、pbunzip2', 'ftp': 'ftp、lftp', 'who': 'who、w',
+    'pbzip2': 'pbzip2、pbunzip2', 'ftp': 'ftp、lftp', 'who_w': 'who、w',
+    'pipeline': '管道',
 }
 
 

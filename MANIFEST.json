@@ -15,7 +15,7 @@
     "linuxstudio-practice/run.cmd": "0c1206c1c108369a70ee7b8b0d4b9b7005201dd32b8f64e60627fcfbb32e774c",
     "linuxstudio-practice/scripts/launcher.py": "61d9d92604531307a6df55ef6528834174fcad22a1ddecabebb3dd72ec1dc6de",
     "linuxstudio-practice/scripts/linuxstudio.py": "bc7e98290674909053984979439eb54844d96bb635bac9206a2837e80284ac9c",
-    "linuxstudio-practice/scripts/linuxstudio_common.py": "b0117eb9279713fa177afac56906ce8275646c9d81eaf34b9c6bf7ab30e02040",
+    "linuxstudio-practice/scripts/linuxstudio_common.py": "47cf159aa9112a4c70cbb972c68b7431bcc6b51223465bf1a6b8acd1115a12d6",
     "linuxstudio-practice/scripts/linuxstudio_login.py": "dff201b6939f5b2823b71f3a9b89d93ded5b5cb6df0d10723a91f48679e04ed6",
     "linuxstudio-practice/scripts/linuxstudio_session.py": "f94e8bbcd411da4c0c9f6dea4dae4a4f58bc5dff90e4cf81b913d7575aaa44ee",
     "linuxstudio-practice/scripts/practice_worker.py": "196dcbb67e5e5917122ff436c4c9b667487f04e6878c85dbc05b48108821ad50",
@@ -23,7 +23,7 @@
     "tests/test_distribution.py": "de364e0b1c99ff4e4d12aa752e4ee644b11e36a09cb1f4f53e2938c1ca022b3d",
     "tests/test_linuxstudio_login.py": "65e25f50a8ba92ed8abbec9459d8c551f077a8e526f29aef401eedccffc2accb",
     "tests/test_linuxstudio_session.py": "50dba4a755170435ff11de94709cbac02f2b5f5ba4939611dd9fc626c52b1436",
-    "tests/test_practice.py": "3cfef84bbf128f4551352a4afd394c1c8c7a2819b2bb9f13fa17d53a3b807eca",
+    "tests/test_practice.py": "c59a63781a27e70b4d0a11b79111c9df2293dacf472c308eb43070dc4d2d373e",
     "tools/build.py": "b9c73979410bc5f901ec1dc14b6557513fa5be588f8a61671e9208d5a10414ec"
   }
 }
